@@ -1,0 +1,2750 @@
+diff --git a/MATERIAL_REDESIGN.md b/MATERIAL_REDESIGN.md
+new file mode 100644
+index 0000000..d7bd92e
+--- /dev/null
++++ b/MATERIAL_REDESIGN.md
+@@ -0,0 +1,50 @@
++# LX Music Mobile：Material 3 改版
++
++基于官方仓库 https://github.com/lyswhut/lx-music-mobile ，固定基线为 master 提交 `fb8480728d875fa5e0da25eebd3a26bb71723aae`，包版本 1.9.1。此改动为本地开发版本，不是官方发布。
++
++## 已实现
++
++- Material 浅色与深色主题：紫色主色、语义配色、分层背景、圆角对话框与按钮、更清晰的文字层级。新安装默认使用 Material 浅色；已有用户可以在「设置 → 主题」选择 Material。开启自动主题时，Material 浅色会随系统切换为 Material 深色。
++- 歌曲列表与底部播放器提供一键收藏。收藏状态随列表更新刷新，多个入口并发点击同一歌曲时只执行一次保存。
++- 音乐库抽屉提供常驻新建入口、歌单搜索、实时歌曲数量、当前歌单高亮。收藏固定在显示顺序最前方；原有存储顺序和菜单操作索引保持一致。
++- 歌单标题提供搜索与播放全部，空歌单提供操作提示。
++- 单曲与多曲添加共用歌单选择器，支持搜索和「新建歌单并添加」；移动时排除来源歌单。
++- 创建歌单使用明确的确认按钮，避免键盘失焦和提交造成重复创建；保存失败保留输入，可直接重试。
++- 添加与移动歌曲等待保存完成再关闭选择器，重复点击不会重复写入。
++- 简体中文、繁体中文和英文界面同步更新。
++
++## 应用补丁与构建
++
++在拥有网络、Node 18+ 和 Android SDK / Java 的开发环境执行：
++
++```sh
++git clone https://github.com/lyswhut/lx-music-mobile.git
++cd lx-music-mobile
++git checkout -b material-redesign fb8480728d875fa5e0da25eebd3a26bb71723aae
++git apply --check /path/to/lx-material.patch
++git apply /path/to/lx-material.patch
++npm ci
++npm run test:library
++npm run lint
++npm run build:theme
++npm run dev
++```
++
++完整环境下构建调试 APK：
++
++```sh
++cd android
++./gradlew assembleDebug
++```
++
++输出位于 `android/app/build/outputs/apk/debug/`。Android 环境配置参考官方说明：https://lyswhut.github.io/lx-music-doc/mobile/use-source-code 。
++
++## 验证结果与当前限制
++
++- 9 项行为检查通过：收藏增删与持久化、并发防重复及失败重试、歌单搜索与来源排除、收藏状态刷新及过期请求清理、创建后添加、创建失败保留输入、重命名及新建位置、文案与图标资源、单曲和批量添加等待保存完成。
++- 新增和修改的 JavaScript / TypeScript 文件通过 Babel 语法解析；主题生成成功；`git diff --check` 通过。
++- 行为检查通过模拟 React 钩子和原生接口边界运行，未完成 Android 实机交互、完整 TypeScript 类型检查和 ESLint 检查。
++- 本次环境的网络代理不可连接、npm 离线缓存不完整，无法安装依赖并构建 APK。工作目录保存了官方文本源码；二进制字体、图片与 Gradle 包未下载。请把补丁应用到正常克隆的完整官方仓库，勿把文本快照直接当作可构建的完整源码包。
++- `material-preview.html` 使用实际音乐库组件投影和示例数据展示设计，供浏览器离线查看；不是 Android 实机截图，也不是完整音乐播放器。
++
++原项目 LICENSE 和 README 协议保持适用。
+diff --git a/package.json b/package.json
+index bd9d2ce..26da012 100644
+--- a/package.json
++++ b/package.json
+@@ -20,7 +20,8 @@
+     "clear": "cd android && gradlew.bat clean",
+     "clear:full": "git clean -fdx -e android/keystore.properties -e android/app/*.keystore",
+     "build:theme": "node src/theme/themes/createThemes.js",
+-    "publish": "node publish"
++    "publish": "node publish",
++    "test:library": "node scripts/test-library.cjs"
+   },
+   "engines": {
+     "node": ">= 18",
+diff --git a/scripts/test-library.cjs b/scripts/test-library.cjs
+new file mode 100644
+index 0000000..5d7611e
+--- /dev/null
++++ b/scripts/test-library.cjs
+@@ -0,0 +1,201 @@
++/* Behavioral checks for library changes; native APIs are mocked at the boundary. */
++const assert = require('node:assert/strict')
++const fs = require('node:fs')
++const path = require('node:path')
++const vm = require('node:vm')
++const { EventEmitter } = require('node:events')
++const root = path.resolve(__dirname, '..')
++const bundle = process.env.LX_BABEL_BUNDLE ? require(process.env.LX_BABEL_BUNDLE) : null
++const babel = bundle ? null : require('@babel/core')
++const compile = file => {
++  const source = fs.readFileSync(path.join(root, file), 'utf8')
++  return bundle
++    ? bundle.babelTransform(source, path.join(root, file), false, [], []).code
++    : babel.transformSync(source, { filename: path.join(root, file), babelrc: false, configFile: false, presets: ['module:@react-native/babel-preset'] }).code
++}
++const jsx = { jsx: (type, props) => ({ type, props }), jsxs: (type, props) => ({ type, props }), Fragment: 'Fragment' }
++const load = (file, mocks, extras = {}) => {
++  const module = { exports: {} }
++  vm.runInNewContext(compile(file), {
++    module, exports: module.exports, Map, Promise, Date, Math,
++    global: extras.global ?? {}, requestAnimationFrame: fn => fn(),
++    require(id) {
++      if (id.endsWith('/jsx-runtime')) return jsx
++      if (Object.hasOwn(mocks, id)) return Object.hasOwn(mocks[id], 'default') ? { ...mocks[id], __esModule: true } : mocks[id]
++      throw new Error(`Unmocked import ${id} in ${file}`)
++    }, ...extras,
++  }, { filename: file })
++  return module.exports
++}
++const deferred = () => { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b }); return { promise, resolve, reject } }
++const tick = async() => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve() }
++const ids = { LOVE: 'love', DEFAULT: 'default' }
++let passed = 0
++const test = async(name, fn) => { await fn(); passed++; console.log(`✓ ${name}`) }
++
++// A minimal hook scheduler to exercise effects, cleanup and async state changes.
++function hooks() {
++  const slots = []; let cursor = 0; let effects = []
++  const react = {
++    useState(initial) {
++      const index = cursor++
++      if (!slots[index]) slots[index] = { value: initial }
++      return [slots[index].value, value => { slots[index].value = typeof value === 'function' ? value(slots[index].value) : value }]
++    },
++    useRef(initial) { const index = cursor++; slots[index] ??= { current: initial }; return slots[index] },
++    useEffect(fn, deps) {
++      const index = cursor++; const previous = slots[index]
++      if (!previous || deps.some((dep, i) => dep !== previous.deps[i])) {
++        previous?.cleanup?.(); slots[index] = { deps }; effects.push(() => { slots[index].cleanup = fn() })
++      }
++    },
++    useImperativeHandle(ref, fn) { if (ref) ref.current = fn() },
++    forwardRef: component => component,
++  }
++  return { react, render(fn) { cursor = 0; const value = fn(); const pending = effects; effects = []; pending.forEach(fn => fn()); return value }, dispose() { slots.forEach(slot => slot.cleanup?.()) } }
++}
++function find(node, type) {
++  if (!node) return null
++  if (Array.isArray(node)) return node.map(n => find(n, type)).find(Boolean)
++  return node.type === type ? node : find(node.props?.children, type)
++}
++
++async function main() {
++  await test('favorite toggles use current saved data and normal list persistence', async() => {
++    let songs = []; let adds = 0; let removes = 0
++    const core = load('src/core/favorites.ts', {
++      '@/config/constant': { LIST_IDS: ids },
++      '@/store/setting/state': { default: { setting: { 'list.addMusicLocationType': 'top' } } },
++      '@/core/list': {
++        getListMusics: async id => { assert.equal(id, ids.LOVE); return songs },
++        addListMusics: async(id, items, position) => { assert.equal(position, 'top'); songs = [...items, ...songs]; adds++ },
++        removeListMusics: async(id, removed) => { songs = songs.filter(s => !removed.includes(s.id)); removes++ },
++      },
++    })
++    const song = { id: 'song-1' }
++    assert.equal(await core.toggleFavorite(song), true)
++    assert.equal(await core.toggleFavorite(song), false)
++    assert.equal(adds, 1); assert.equal(removes, 1); assert.equal(songs.length, 0)
++  })
++  await test('concurrent copies of a song share one favorite write; failures can retry', async() => {
++    const wait = deferred(); let adds = 0; let failed = true
++    const core = load('src/core/favorites.ts', {
++      '@/config/constant': { LIST_IDS: ids },
++      '@/store/setting/state': { default: { setting: { 'list.addMusicLocationType': 'top' } } },
++      '@/core/list': { getListMusics: async() => { await wait.promise; return [] }, removeListMusics: async() => {}, addListMusics: async() => { adds++; if (failed) throw new Error('storage unavailable') } },
++    })
++    const first = core.toggleFavorite({ id: 'song-2' }); const second = core.toggleFavorite({ id: 'song-2' })
++    assert.equal(first, second); wait.resolve()
++    await assert.rejects(first, /storage unavailable/); assert.equal(adds, 1)
++    failed = false; assert.equal(await core.toggleFavorite({ id: 'song-2' }), true); assert.equal(adds, 2)
++  })
++  await test('playlist search pins favorites, preserves order and excludes a move source', () => {
++    const { filterPlaylists } = load('src/utils/playlist.ts', { '@/config/constant': { LIST_IDS: ids } })
++    const lists = [{ id: 'default', name: '试听列表' }, { id: 'love', name: '我的收藏' }, { id: 'one', name: 'Morning MIX' }, { id: 'two', name: '我的夜晚' }]
++    assert.equal(filterPlaylists(lists, '')[0].id, 'love')
++    assert.equal(filterPlaylists(lists, '  mix ')[0].id, 'one')
++    assert.equal(filterPlaylists(lists, '我的', 'love')[0].id, 'two')
++    assert.equal(filterPlaylists(lists, '不存在').length, 0)
++    assert.equal(lists[0].id, 'default')
++  })
++  await test('membership reacts to list events, discards stale reads and cleans up subscriptions', async() => {
++    const scheduler = hooks(); const app = new EventEmitter(); const state = new EventEmitter(); const reads = []
++    const { useMusicExistsList, useListMusicCount } = load('src/store/list/hook.ts', {
++      react: scheduler.react, './state': { default: { allList: [] } },
++      '@/core/list': { getListMusics: () => { const request = deferred(); reads.push(request); return request.promise } },
++    }, { global: { app_event: app, state_event: state } })
++    let song = { id: 'old' }
++    const render = () => scheduler.render(() => useMusicExistsList({ id: 'love' }, song))
++    render(); song = { id: 'new' }; render()
++    reads[1].resolve([{ id: 'new' }]); await tick(); assert.equal(render(), true)
++    reads[0].resolve([]); await tick(); assert.equal(render(), true)
++    app.emit('myListMusicUpdate', ['default']); assert.equal(reads.length, 2)
++    app.emit('myListMusicUpdate', ['love']); reads[2].resolve([]); await tick(); assert.equal(render(), false)
++    scheduler.dispose(); assert.equal(app.listenerCount('myListMusicUpdate'), 0)
++    const countHooks = hooks()
++    // Use a fresh module and scheduler for the count hook.
++    const counts = load('src/store/list/hook.ts', { react: countHooks.react, './state': { default: {} }, '@/core/list': { getListMusics: async() => [{ id: 1 }, { id: 2 }] } }, { global: { app_event: app, state_event: state } })
++    countHooks.render(() => counts.useListMusicCount('love')); await tick()
++    assert.equal(countHooks.render(() => counts.useListMusicCount('love')), 2); countHooks.dispose()
++    assert.equal(typeof useListMusicCount, 'function')
++  })
++  const formMocks = (scheduler, create, confirm = async() => true) => ({
++    react: scheduler.react, 'react-native': { View: 'View' },
++    '@/components/common/Input': { default: 'Input' }, '@/components/common/Button': { default: 'Button' }, '@/components/common/Text': { default: 'Text' },
++    '@/utils/tools': { createStyle: styles => styles, toast() {}, confirmDialog: confirm },
++    '@/lang': { useI18n: () => key => key }, '@/core/list': { createUserList: create },
++    '@/store/list/state': { default: { userList: [] } }, '@/store/theme/hook': { useTheme: () => ({}) },
++    '@/theme/material': { getMaterialColors: () => ({}) },
++  })
++  await test('creating and adding submits once, waits for persistence, and does not submit on blur', async() => {
++    const scheduler = hooks(); const wait = deferred(); let creates = 0; let hidden = 0; let created
++    const Form = load('src/components/MusicAddModal/CreateUserList.tsx', formMocks(scheduler, async(position, lists) => { creates++; assert.equal(lists[0].name, '夜晚'); await wait.promise })).default
++    const props = { isEdit: true, onHide: () => hidden++, onCreated: list => { created = list } }
++    let tree = scheduler.render(() => Form(props)); find(tree, 'Input').props.onChangeText(' 夜晚 ')
++    tree = scheduler.render(() => Form(props)); assert.equal(find(tree, 'Input').props.onBlur, undefined)
++    const first = find(tree, 'Input').props.onSubmitEditing(); const second = find(tree, 'Input').props.onSubmitEditing()
++    assert.equal(creates, 1); assert.equal(hidden, 0); wait.resolve(); await Promise.all([first, second])
++    assert.equal(hidden, 1); assert.equal(created.name, '夜晚')
++  })
++  await test('failed playlist persistence keeps the form available to retry', async() => {
++    const scheduler = hooks(); let hidden = 0
++    const Form = load('src/components/MusicAddModal/CreateUserList.tsx', formMocks(scheduler, async() => { throw new Error('disk full') })).default
++    const props = { isEdit: true, onHide: () => hidden++ }
++    let tree = scheduler.render(() => Form(props)); find(tree, 'Input').props.onChangeText('新歌单')
++    tree = scheduler.render(() => Form(props)); await find(tree, 'Input').props.onSubmitEditing()
++    tree = scheduler.render(() => Form(props)); assert.equal(hidden, 0)
++    assert.equal(find(tree, 'Text').props.children, 'library_save_failed')
++    assert.equal(find(tree, 'Input').props.editable, true)
++  })
++  await test('playlist name editor keeps rename text and uses the requested create position', async() => {
++    const scheduler = hooks(); const writes = []
++    const mocks = formMocks(scheduler, async(position, lists) => { writes.push({ position, lists }) })
++    mocks['@/core/list'].updateUserList = async lists => { writes.push({ renamed: lists }) }
++    mocks['@/components/common/ConfirmAlert'] = { default: 'ConfirmAlert' }
++    const Editor = load('src/screens/Home/Views/Mylist/MyList/ListNameEdit.tsx', mocks).default
++    const ref = { current: null }
++    let tree = scheduler.render(() => Editor({}, ref))
++    ref.current.show({ id: 'existing', name: '原来的名字', locationUpdateTime: 1 })
++    tree = scheduler.render(() => Editor({}, ref))
++    assert.equal(find(tree, 'Input').props.value, '原来的名字')
++    find(tree, 'Input').props.onChangeText('新名字')
++    tree = scheduler.render(() => Editor({}, ref)); await find(tree, 'ConfirmAlert').props.onConfirm()
++    assert.equal(writes[0].renamed[0].id, 'existing'); assert.equal(writes[0].renamed[0].name, '新名字')
++    ref.current.showCreate(3)
++    tree = scheduler.render(() => Editor({}, ref)); assert.equal(find(tree, 'Input').props.value, '')
++    find(tree, 'Input').props.onChangeText('另一个歌单')
++    tree = scheduler.render(() => Editor({}, ref)); await find(tree, 'ConfirmAlert').props.onConfirm()
++    assert.equal(writes[1].position, 3); assert.equal(writes[1].lists[0].name, '另一个歌单')
++  })
++  await test('all translations and static icon names used by redesigned components exist', () => {
++    const locales = ['zh-cn', 'zh-tw', 'en-us'].map(locale => JSON.parse(fs.readFileSync(path.join(root, 'src/lang', locale + '.json'))))
++    const files = ['src/components/FavoriteButton.tsx', 'src/components/PlaylistPicker.tsx', 'src/components/MusicAddModal/CreateUserList.tsx', 'src/screens/Home/Views/Mylist/MyList/List.tsx', 'src/screens/Home/Views/Mylist/MyList/ListNameEdit.tsx', 'src/screens/Home/Views/Mylist/MusicList/ActiveList.tsx']
++    const icons = new Set(JSON.parse(fs.readFileSync(path.join(root, 'src/resources/fonts/selection.json'))).icons.map(icon => icon.properties.name))
++    for (const file of files) {
++      const source = fs.readFileSync(path.join(root, file), 'utf8')
++      for (const match of source.matchAll(/t\('([^']+)'/g)) for (const locale of locales) assert.equal(typeof locale[match[1]], 'string', match[1])
++      for (const match of source.matchAll(/name="([^"{}]+)"/g)) assert.ok(icons.has(match[1]), match[1])
++    }
++  })
++  await test('single and multi-song pickers wait for writes and ignore double taps', async() => {
++    for (const multi of [false, true]) {
++      const scheduler = hooks(); const wait = deferred(); const visibility = []; let calls = 0; let added = 0
++      const file = multi ? 'src/components/MusicMultiAddModal/MusicMultiAddModal.tsx' : 'src/components/MusicAddModal/MusicAddModal.tsx'
++      const Picker = load(file, {
++        react: scheduler.react, '@/components/common/Dialog': { default: 'Dialog' }, '@/utils/tools': { toast() {} },
++        './Title': { default: 'Title' }, './List': { default: 'List' }, '@/lang': { useI18n: () => key => key },
++        '@/core/list': { addListMusics: async() => { calls++; await wait.promise }, moveListMusics: async() => {} },
++        '@/store/setting/state': { default: { setting: { 'list.addMusicLocationType': 'top' } } },
++      }).default
++      const ref = { current: null }; const props = { onAdded: () => added++ }
++      let tree = scheduler.render(() => Picker(props, ref)); tree.props.ref.current = { setVisible: value => visibility.push(value) }
++      ref.current.show(multi ? { selectedList: [{ id: 'one' }, { id: 'two' }], listId: 'default', isMove: false } : { musicInfo: { id: 'one' }, listId: 'default', isMove: false })
++      tree = scheduler.render(() => Picker(props, ref)); const select = find(tree, 'List').props.onPress
++      select({ id: 'night' }); select({ id: 'night' })
++      assert.equal(calls, 1); assert.equal(visibility.includes(false), false)
++      wait.resolve(); await tick(); assert.equal(added, 1); assert.equal(visibility.includes(false), true)
++    }
++  })
++  console.log(`\n${passed} library behavior checks passed.`)
++}
++main().catch(error => { console.error(error); process.exitCode = 1 })
+diff --git a/src/components/FavoriteButton.tsx b/src/components/FavoriteButton.tsx
+new file mode 100644
+index 0000000..6594037
+--- /dev/null
++++ b/src/components/FavoriteButton.tsx
+@@ -0,0 +1,46 @@
++import { memo, useRef, useState } from 'react'
++import Button from '@/components/common/Button'
++import { Icon } from '@/components/common/Icon'
++import { toggleFavorite } from '@/core/favorites'
++import { useMusicExistsList } from '@/store/list/hook'
++import listState from '@/store/list/state'
++import { useTheme } from '@/store/theme/hook'
++import { getMaterialColors } from '@/theme/material'
++import { useI18n } from '@/lang'
++import { toast } from '@/utils/tools'
++
++export default memo(({ musicInfo }: { musicInfo: LX.Music.MusicInfo }) => {
++  const colors = getMaterialColors(useTheme())
++  const saved = useMusicExistsList(listState.loveList, musicInfo)
++  const [busy, setBusy] = useState(false)
++  const pendingRef = useRef(false)
++  const t = useI18n()
++
++  const handlePress = async() => {
++    if (pendingRef.current) return
++    pendingRef.current = true
++    setBusy(true)
++    try {
++      const added = await toggleFavorite(musicInfo)
++      toast(t(added ? 'collect_success' : 'library_favorite_removed'))
++    } catch {
++      toast(t('library_save_failed'))
++    } finally {
++      pendingRef.current = false
++      setBusy(false)
++    }
++  }
++
++  return (
++    <Button
++      onPress={handlePress}
++      disabled={busy}
++      accessibilityRole="button"
++      accessibilityLabel={t(saved ? 'library_unfavorite' : 'collect') + ' · ' + musicInfo.name}
++      accessibilityState={{ selected: saved, disabled: busy, busy }}
++      style={{ width: 48, height: 48, borderRadius: 24, alignItems: 'center', justifyContent: 'center', backgroundColor: saved ? colors.container : 'transparent' }}
++    >
++      <Icon name="love" size={20} color={saved ? colors.onContainer : colors.onSurfaceVariant} />
++    </Button>
++  )
++})
+diff --git a/src/components/MusicAddModal/CreateUserList.tsx b/src/components/MusicAddModal/CreateUserList.tsx
+index a2113fb..6aa53a8 100644
+--- a/src/components/MusicAddModal/CreateUserList.tsx
++++ b/src/components/MusicAddModal/CreateUserList.tsx
+@@ -1,69 +1,87 @@
+ import { useState, useRef, useEffect } from 'react'
+ import { View } from 'react-native'
+ import Input, { type InputType } from '@/components/common/Input'
+-import { confirmDialog, createStyle } from '@/utils/tools'
++import Button from '@/components/common/Button'
++import Text from '@/components/common/Text'
++import { confirmDialog, createStyle, toast } from '@/utils/tools'
+ import { useI18n } from '@/lang'
+ import { createUserList } from '@/core/list'
+ import listState from '@/store/list/state'
++import { useTheme } from '@/store/theme/hook'
++import { getMaterialColors } from '@/theme/material'
+ 
+-export default ({ isEdit, onHide }: {
++export default ({ isEdit, onHide, onCreated }: {
+   isEdit: boolean
+   onHide: () => void
++  onCreated?: (list: LX.List.UserListInfo) => void
+ }) => {
+   const [text, setText] = useState('')
++  const [busy, setBusy] = useState(false)
++  const [error, setError] = useState('')
++  const submitting = useRef(false)
+   const inputRef = useRef<InputType>(null)
+   const t = useI18n()
++  const colors = getMaterialColors(useTheme())
+ 
+   useEffect(() => {
+-    if (isEdit) {
+-      setText('')
+-      requestAnimationFrame(() => {
+-        inputRef.current?.focus()
+-      })
+-    }
++    if (!isEdit) return
++    setText('')
++    requestAnimationFrame(() => { inputRef.current?.focus() })
+   }, [isEdit])
+ 
+-  const handleSubmitEditing = async() => {
+-    onHide()
++  const handleSubmit = async() => {
++    if (submitting.current) return
+     const name = text.trim()
+-    if (!name.length || (listState.userList.some(l => l.name == name) && !(await confirmDialog({
+-      message: global.i18n.t('list_duplicate_tip'),
+-    })))) return
+-    void createUserList(listState.userList.length, [{ id: `userlist_${Date.now()}`, name, locationUpdateTime: null }])
++    if (!name) { setError(t('library_name_required')); return }
++    submitting.current = true
++    setBusy(true)
++    setError('')
++    try {
++      if (listState.userList.some(l => l.name === name) && !(await confirmDialog({ message: t('list_duplicate_tip') }))) return
++      const now = Date.now()
++      const list = { id: `userlist_${now}_${Math.random().toString(36).slice(2, 8)}`, name, locationUpdateTime: now }
++      await createUserList(listState.userList.length, [list])
++      onCreated?.(list)
++      onHide()
++    } catch {
++      setError(t('library_save_failed'))
++      toast(t('library_save_failed'))
++    } finally {
++      submitting.current = false
++      setBusy(false)
++    }
+   }
+ 
+-  return isEdit
+-    ? (
+-      <View style={styles.imputContainer}>
+-        <Input
+-          placeholder={t('list_create_input_placeholder')}
+-          value={text}
+-          onChangeText={setText}
+-          ref={inputRef}
+-          onBlur={handleSubmitEditing}
+-          onSubmitEditing={handleSubmitEditing}
+-          style={styles.input}
+-        />
++  return isEdit ? (
++    <View style={{ ...styles.container, backgroundColor: colors.surfaceContainer }}>
++      <Input
++        placeholder={t('list_create_input_placeholder')}
++        accessibilityLabel={t('list_create_input_placeholder')}
++        value={text}
++        onChangeText={value => { setText(value); setError('') }}
++        ref={inputRef}
++        maxLength={100}
++        editable={!busy}
++        returnKeyType="done"
++        onSubmitEditing={handleSubmit}
++        style={styles.input}
++      />
++      {error ? <Text accessibilityLiveRegion="polite" size={12}>{error}</Text> : null}
++      <View style={styles.actions}>
++        <Button style={styles.button} onPress={onHide} disabled={busy} accessibilityRole="button">
++          <Text color={colors.primary}>{t('cancel')}</Text>
++        </Button>
++        <Button style={{ ...styles.button, backgroundColor: colors.primary }} onPress={handleSubmit} disabled={busy || !text.trim()} accessibilityRole="button" accessibilityState={{ busy }}>
++          <Text color={colors.onPrimary}>{t(onCreated ? 'library_create_add' : 'list_create')}</Text>
++        </Button>
+       </View>
+-      )
+-    : null
++    </View>
++  ) : null
+ }
+ 
+ const styles = createStyle({
+-  imputContainer: {
+-    position: 'absolute',
+-    top: 0,
+-    left: 0,
+-    width: '100%',
+-    height: '100%',
+-    paddingBottom: 10,
+-    // backgroundColor: 'rgba(0,0,0,0.2)',
+-  },
+-  input: {
+-    flex: 1,
+-    fontSize: 14,
+-    borderRadius: 4,
+-    textAlign: 'center',
+-    height: '100%',
+-  },
++  container: { borderRadius: 16, padding: 12, marginBottom: 12 },
++  input: { minHeight: 48, borderRadius: 12, paddingHorizontal: 12 },
++  actions: { flexDirection: 'row', justifyContent: 'flex-end', flexWrap: 'wrap', marginTop: 8 },
++  button: { minHeight: 48, borderRadius: 24, paddingHorizontal: 16, justifyContent: 'center', marginLeft: 4 },
+ })
+diff --git a/src/components/MusicAddModal/List.tsx b/src/components/MusicAddModal/List.tsx
+index b401139..45a16c7 100644
+--- a/src/components/MusicAddModal/List.tsx
++++ b/src/components/MusicAddModal/List.tsx
+@@ -1,74 +1,7 @@
+-import { useMemo, useState } from 'react'
+-import { ScrollView, TouchableOpacity, View } from 'react-native'
++import PlaylistPicker from '@/components/PlaylistPicker'
+ 
+-import Text from '@/components/common/Text'
+-import { useMyList } from '@/store/list/hook'
+-import ListItem, { styles as listStyles } from './ListItem'
+-import CreateUserList from './CreateUserList'
+-import { useWindowSize } from '@/utils/hooks'
+-import { useTheme } from '@/store/theme/hook'
+-import { useI18n } from '@/lang'
+-import { createStyle } from '@/utils/tools'
+-import { scaleSizeW } from '@/utils/pixelRatio'
+-
+-const styles = createStyle({
+-  list: {
+-    paddingLeft: 15,
+-    paddingRight: 2,
+-    paddingBottom: 5,
+-    flexDirection: 'row',
+-    flexWrap: 'wrap',
+-    // backgroundColor: 'rgba(0,0,0,0.2)'
+-    // justifyContent: 'center',
+-  },
+-})
+-const MIN_WIDTH = scaleSizeW(150)
+-const PADDING = styles.list.paddingLeft + styles.list.paddingRight
+-
+-
+-const EditListItem = ({ itemWidth }: {
+-  itemWidth: number
+-}) => {
+-  const [isEdit, setEdit] = useState(false)
+-  const theme = useTheme()
+-  const t = useI18n()
+-
+-  return (
+-    <View style={{ ...listStyles.listItem, width: itemWidth }}>
+-      <TouchableOpacity
+-        style={{ ...listStyles.button, borderColor: theme['c-primary-light-200-alpha-700'], borderStyle: 'dashed' }}
+-        onPress={() => { setEdit(true) }}
+-      >
+-        <Text style={{ opacity: isEdit ? 0 : 1 }} numberOfLines={1} size={14} color={theme['c-button-font']}>{t('list_create')}</Text>
+-      </TouchableOpacity>
+-      {
+-        isEdit
+-          ? <CreateUserList isEdit={isEdit} onHide={() => { setEdit(false) }} />
+-          : null
+-      }
+-    </View>
+-  )
+-}
+-
+-export default ({ musicInfo, onPress }: {
++export default ({ musicInfo, excludeId, onPress }: {
+   musicInfo: LX.Music.MusicInfo
++  excludeId?: string
+   onPress: (listInfo: LX.List.MyListInfo) => void
+-}) => {
+-  const windowSize = useWindowSize()
+-  const allList = useMyList()
+-  const itemWidth = useMemo(() => {
+-    let w = Math.floor(windowSize.width * 0.9 - PADDING)
+-    let n = Math.floor(w / MIN_WIDTH)
+-    if (n > 10) n = 10
+-    return Math.floor((w - 1) / n)
+-  }, [windowSize])
+-
+-  return (
+-    <ScrollView style={{ flexGrow: 0 }}>
+-      <View style={styles.list} onStartShouldSetResponder={() => true}>
+-        { allList.map(info => <ListItem key={info.id} listInfo={info} musicInfo={musicInfo} onPress={onPress} width={itemWidth} />) }
+-        <EditListItem itemWidth={itemWidth} />
+-      </View>
+-    </ScrollView>
+-  )
+-}
++}) => <PlaylistPicker musicInfo={musicInfo} excludeId={excludeId} onPress={onPress} />
+diff --git a/src/components/MusicAddModal/MusicAddModal.tsx b/src/components/MusicAddModal/MusicAddModal.tsx
+index 5591fd0..2b9ee44 100644
+--- a/src/components/MusicAddModal/MusicAddModal.tsx
++++ b/src/components/MusicAddModal/MusicAddModal.tsx
+@@ -28,6 +28,8 @@ export interface MusicAddModalType {
+ }
+ 
+ export default forwardRef<MusicAddModalType, MusicAddModalProps>(({ onAdded }, ref) => {
++  const savingRef = useRef(false)
++  const [saving, setSaving] = useState(false)
+   const t = useI18n()
+   const dialogRef = useRef<DialogType>(null)
+   const [selectInfo, setSelectInfo] = useState<SelectInfo>(initSelectInfo as SelectInfo)
+@@ -43,43 +45,51 @@ export default forwardRef<MusicAddModalType, MusicAddModalProps>(({ onAdded }, r
+   }))
+ 
+   const handleHide = () => {
+-    requestAnimationFrame(() => {
+-      setSelectInfo({ ...selectInfo, musicInfo: null })
+-    })
++    setSelectInfo(info => ({ ...info, musicInfo: null }))
+   }
+ 
+   const handleSelect = (listInfo: LX.List.MyListInfo) => {
+-    dialogRef.current?.setVisible(false)
++    if (savingRef.current) return
++    savingRef.current = true
++    setSaving(true)
+     if (selectInfo.isMove) {
+       void moveListMusics(selectInfo.listId, listInfo.id,
+         [selectInfo.musicInfo!],
+         settingState.setting['list.addMusicLocationType'],
+       ).then(() => {
++        dialogRef.current?.setVisible(false)
+         onAdded?.()
+         toast(t('list_edit_action_tip_move_success'))
+       }).catch(() => {
+         toast(t('list_edit_action_tip_move_failed'))
++      }).finally(() => {
++        savingRef.current = false
++        setSaving(false)
+       })
+     } else {
+       void addListMusics(listInfo.id,
+         [selectInfo.musicInfo!],
+         settingState.setting['list.addMusicLocationType'],
+       ).then(() => {
++        dialogRef.current?.setVisible(false)
+         onAdded?.()
+         toast(t('list_edit_action_tip_add_success'))
+       }).catch(() => {
+         toast(t('list_edit_action_tip_add_failed'))
++      }).finally(() => {
++        savingRef.current = false
++        setSaving(false)
+       })
+     }
+   }
+ 
+   return (
+-    <Dialog ref={dialogRef} onHide={handleHide}>
++    <Dialog ref={dialogRef} onHide={handleHide} bgHide={!saving} keyHide={!saving} closeBtn={!saving}>
+       {
+         selectInfo.musicInfo
+           ? (<>
+               <Title musicInfo={selectInfo.musicInfo} isMove={selectInfo.isMove} />
+-              <List musicInfo={selectInfo.musicInfo} onPress={handleSelect} />
++              <List musicInfo={selectInfo.musicInfo} excludeId={selectInfo.isMove ? selectInfo.listId : undefined} onPress={handleSelect} />
+             </>)
+           : null
+       }
+diff --git a/src/components/MusicMultiAddModal/List.tsx b/src/components/MusicMultiAddModal/List.tsx
+index 9ef7a99..fa77fcb 100644
+--- a/src/components/MusicMultiAddModal/List.tsx
++++ b/src/components/MusicMultiAddModal/List.tsx
+@@ -1,72 +1,6 @@
+-import { useMemo, useState } from 'react'
+-import { ScrollView, TouchableOpacity, View } from 'react-native'
+-
+-import Text from '@/components/common/Text'
+-import { useMyList } from '@/store/list/hook'
+-import ListItem, { styles as listStyles } from './ListItem'
+-import CreateUserList from '../MusicAddModal/CreateUserList'
+-import { useWindowSize } from '@/utils/hooks'
+-import { useTheme } from '@/store/theme/hook'
+-import { useI18n } from '@/lang'
+-import { createStyle } from '@/utils/tools'
+-import { scaleSizeW } from '@/utils/pixelRatio'
+-
+-const styles = createStyle({
+-  list: {
+-    paddingLeft: 15,
+-    paddingRight: 2,
+-    paddingBottom: 5,
+-    flexDirection: 'row',
+-    flexWrap: 'wrap',
+-    // backgroundColor: 'rgba(0,0,0,0.2)'
+-  },
+-})
+-const MIN_WIDTH = scaleSizeW(140)
+-const PADDING = styles.list.paddingLeft + styles.list.paddingRight
+-
+-const EditListItem = ({ itemWidth }: {
+-  itemWidth: number
+-}) => {
+-  const [isEdit, setEdit] = useState(false)
+-  const theme = useTheme()
+-  const t = useI18n()
+-
+-  return (
+-    <View style={{ ...listStyles.listItem, width: itemWidth }}>
+-      <TouchableOpacity
+-        style={{ ...listStyles.button, borderColor: theme['c-primary-light-200-alpha-700'], borderStyle: 'dashed' }}
+-        onPress={() => { setEdit(true) }}
+-      >
+-        <Text style={{ opacity: isEdit ? 0 : 1 }} numberOfLines={1} size={14} color={theme['c-button-font']}>{t('list_create')}</Text>
+-      </TouchableOpacity>
+-      {
+-        isEdit
+-          ? <CreateUserList isEdit={isEdit} onHide={() => { setEdit(false) }} />
+-          : null
+-      }
+-    </View>
+-  )
+-}
++import PlaylistPicker from '@/components/PlaylistPicker'
+ 
+ export default ({ listId, onPress }: {
+   listId: string
+   onPress: (listInfo: LX.List.MyListInfo) => void
+-}) => {
+-  const windowSize = useWindowSize()
+-  const allList = useMyList().filter(l => l.id != listId)
+-  const itemWidth = useMemo(() => {
+-    let w = Math.floor(windowSize.width * 0.9 - PADDING)
+-    let n = Math.floor(w / MIN_WIDTH)
+-    if (n > 10) n = 10
+-    return Math.floor((w - 1) / n)
+-  }, [windowSize])
+-
+-  return (
+-    <ScrollView style={{ flexGrow: 0 }}>
+-      <View style={{ ...styles.list }} onStartShouldSetResponder={() => true}>
+-        { allList.map(info => <ListItem key={info.id} listInfo={info} onPress={onPress} width={itemWidth} />) }
+-        <EditListItem itemWidth={itemWidth} />
+-      </View>
+-    </ScrollView>
+-  )
+-}
++}) => <PlaylistPicker excludeId={listId} onPress={onPress} />
+diff --git a/src/components/MusicMultiAddModal/MusicMultiAddModal.tsx b/src/components/MusicMultiAddModal/MusicMultiAddModal.tsx
+index d742e6f..544dffe 100644
+--- a/src/components/MusicMultiAddModal/MusicMultiAddModal.tsx
++++ b/src/components/MusicMultiAddModal/MusicMultiAddModal.tsx
+@@ -28,6 +28,8 @@ export interface MusicMultiAddModalType {
+ }
+ 
+ export default forwardRef<MusicMultiAddModalType, MusicMultiAddModalProps>(({ onAdded }, ref) => {
++  const savingRef = useRef(false)
++  const [saving, setSaving] = useState(false)
+   const t = useI18n()
+   const dialogRef = useRef<DialogType>(null)
+   const [selectInfo, setSelectInfo] = useState<SelectInfo>(initSelectInfo)
+@@ -43,38 +45,46 @@ export default forwardRef<MusicMultiAddModalType, MusicMultiAddModalProps>(({ on
+   }))
+ 
+   const handleHide = () => {
+-    requestAnimationFrame(() => {
+-      setSelectInfo({ ...selectInfo, selectedList: [] })
+-    })
++    setSelectInfo(info => ({ ...info, selectedList: [] }))
+   }
+ 
+   const handleSelect = (listInfo: LX.List.MyListInfo) => {
+-    dialogRef.current?.setVisible(false)
++    if (savingRef.current) return
++    savingRef.current = true
++    setSaving(true)
+     if (selectInfo.isMove) {
+       void moveListMusics(selectInfo.listId, listInfo.id,
+         [...selectInfo.selectedList],
+         settingState.setting['list.addMusicLocationType'],
+       ).then(() => {
++        dialogRef.current?.setVisible(false)
+         onAdded?.()
+         toast(t('list_edit_action_tip_move_success'))
+       }).catch(() => {
+         toast(t('list_edit_action_tip_move_failed'))
++      }).finally(() => {
++        savingRef.current = false
++        setSaving(false)
+       })
+     } else {
+       void addListMusics(listInfo.id,
+         [...selectInfo.selectedList],
+         settingState.setting['list.addMusicLocationType'],
+       ).then(() => {
++        dialogRef.current?.setVisible(false)
+         onAdded?.()
+         toast(t('list_edit_action_tip_add_success'))
+       }).catch(() => {
+         toast(t('list_edit_action_tip_add_failed'))
++      }).finally(() => {
++        savingRef.current = false
++        setSaving(false)
+       })
+     }
+   }
+ 
+   return (
+-    <Dialog ref={dialogRef} onHide={handleHide}>
++    <Dialog ref={dialogRef} onHide={handleHide} bgHide={!saving} keyHide={!saving} closeBtn={!saving}>
+       {
+         selectInfo.selectedList.length
+           ? (<>
+diff --git a/src/components/OnlineList/ListItem.tsx b/src/components/OnlineList/ListItem.tsx
+index d258817..eabf44b 100644
+--- a/src/components/OnlineList/ListItem.tsx
++++ b/src/components/OnlineList/ListItem.tsx
+@@ -9,6 +9,7 @@ import { useTheme } from '@/store/theme/hook'
+ import { scaleSizeH } from '@/utils/pixelRatio'
+ import { LIST_ITEM_HEIGHT } from '@/config/constant'
+ import { createStyle, type RowInfo } from '@/utils/tools'
++import FavoriteButton from '@/components/FavoriteButton'
+ 
+ export const ITEM_HEIGHT = scaleSizeH(LIST_ITEM_HEIGHT)
+ 
+@@ -61,23 +62,24 @@ export default memo(({ item, index, showSource, onPress, onLongPress, onShowMenu
+   return (
+     <View style={{ ...styles.listItem, width: rowInfo.rowWidth, height: ITEM_HEIGHT, backgroundColor: isSelected ? theme['c-primary-background-hover'] : 'rgba(0,0,0,0)' }}>
+       <TouchableOpacity style={styles.listItemLeft} onPress={() => { onPress(item, index) }} onLongPress={() => { onLongPress(item, index) }}>
+-        <Text style={styles.sn} size={13} color={theme['c-300']}>{index + 1}</Text>
++        <Text style={styles.sn} size={13} color={theme['c-font-label']}>{index + 1}</Text>
+         <View style={styles.itemInfo}>
+           <Text numberOfLines={1}>{item.name}</Text>
+           <View style={styles.listItemSingle}>
+             { tagInfo.type ? <Badge type={tagInfo.type}>{tagInfo.text}</Badge> : null }
+             { showSource ? <Badge type="tertiary">{item.source}</Badge> : null }
+-            <Text style={styles.listItemSingleText} size={11} color={theme['c-500']} numberOfLines={1}>{singer}</Text>
++            <Text style={styles.listItemSingleText} size={12} color={theme['c-font-label']} numberOfLines={1}>{singer}</Text>
+           </View>
+         </View>
+         {
+           isShowInterval ? (
+-            <Text size={12} color={theme['c-250']} numberOfLines={1}>{item.interval}</Text>
++            <Text size={12} color={theme['c-font-label']} numberOfLines={1}>{item.interval}</Text>
+           ) : null
+         }
+       </TouchableOpacity>
+-     <TouchableOpacity onPress={handleShowMenu} ref={moreButtonRef} style={styles.moreButton}>
+-        <Icon name="dots-vertical" style={{ color: theme['c-350'] }} size={12} />
++      <FavoriteButton musicInfo={item} />
++     <TouchableOpacity accessibilityRole="button" accessibilityLabel={item.name + ' · ' + global.i18n.t('library_more')} onPress={handleShowMenu} ref={moreButtonRef} style={styles.moreButton}>
++        <Icon name="dots-vertical" style={{ color: theme['c-font-label'] }} size={18} />
+       </TouchableOpacity>
+     </View>
+   )
+@@ -159,7 +161,7 @@ const styles = createStyle({
+     justifyContent: 'center',
+   },
+   moreButton: {
+-    height: '80%',
++    height: 48,
+     paddingLeft: 16,
+     paddingRight: 16,
+     // paddingTop: 10,
+@@ -168,4 +170,3 @@ const styles = createStyle({
+     justifyContent: 'center',
+   },
+ })
+-
+diff --git a/src/components/PlaylistPicker.tsx b/src/components/PlaylistPicker.tsx
+new file mode 100644
+index 0000000..757c7ee
+--- /dev/null
++++ b/src/components/PlaylistPicker.tsx
+@@ -0,0 +1,84 @@
++import { useState } from 'react'
++import { FlatList, View } from 'react-native'
++import Input from '@/components/common/Input'
++import Button from '@/components/common/Button'
++import Text from '@/components/common/Text'
++import { Icon } from '@/components/common/Icon'
++import CreateUserList from '@/components/MusicAddModal/CreateUserList'
++import { useMyList, useMusicExistsList } from '@/store/list/hook'
++import { useTheme } from '@/store/theme/hook'
++import { useI18n } from '@/lang'
++import { getMaterialColors } from '@/theme/material'
++import { filterPlaylists } from '@/utils/playlist'
++import { LIST_IDS } from '@/config/constant'
++import { createStyle } from '@/utils/tools'
++
++const PlaylistRow = ({ list, musicInfo, onPress, disabled }: {
++  list: LX.List.MyListInfo
++  musicInfo?: LX.Music.MusicInfo
++  onPress: (list: LX.List.MyListInfo) => void
++  disabled: boolean
++}) => {
++  const colors = getMaterialColors(useTheme())
++  const t = useI18n()
++  return (
++    <Button style={{ ...styles.row, backgroundColor: colors.surfaceContainer }} onPress={() => { onPress(list) }} disabled={disabled} accessibilityRole="button" accessibilityLabel={list.name + (disabled ? ' · ' + t('library_saved') : '')}>
++      <Icon name={list.id === LIST_IDS.LOVE ? 'love' : 'album'} color={colors.primary} size={22} />
++      <Text style={{ flex: 1, marginLeft: 16 }} numberOfLines={1}>{list.name}</Text>
++      {disabled && musicInfo ? <Text color={colors.onSurfaceVariant} size={12}>{t('library_saved')}</Text> : <Icon name="chevron-right" color={colors.onSurfaceVariant} size={14} />}
++    </Button>
++  )
++}
++
++const MusicPlaylistRow = ({ list, musicInfo, onPress }: {
++  list: LX.List.MyListInfo
++  musicInfo: LX.Music.MusicInfo
++  onPress: (list: LX.List.MyListInfo) => void
++}) => {
++  const exists = useMusicExistsList(list, musicInfo)
++  return <PlaylistRow list={list} musicInfo={musicInfo} onPress={onPress} disabled={exists} />
++}
++
++export default ({ musicInfo, excludeId, onPress }: {
++  musicInfo?: LX.Music.MusicInfo
++  excludeId?: string
++  onPress: (list: LX.List.MyListInfo) => void
++}) => {
++  const [keyword, setKeyword] = useState('')
++  const [creating, setCreating] = useState(false)
++  const colors = getMaterialColors(useTheme())
++  const lists = filterPlaylists(useMyList(), keyword, excludeId)
++  const t = useI18n()
++
++  return (
++    <View style={styles.container}>
++      <View style={{ ...styles.search, backgroundColor: colors.surfaceContainer }}>
++        <Icon name="search-2" color={colors.onSurfaceVariant} size={18} />
++        <Input value={keyword} onChangeText={setKeyword} clearBtn placeholder={t('library_search_lists')} accessibilityLabel={t('library_search_lists')} style={styles.input} />
++      </View>
++      <Button onPress={() => { setCreating(true) }} style={styles.create} accessibilityRole="button">
++        <Icon name="add_folder" color={colors.primary} size={20} />
++        <Text color={colors.primary} style={{ marginLeft: 12 }}>{t('library_create_add')}</Text>
++      </Button>
++      {creating ? <CreateUserList isEdit onHide={() => { setCreating(false) }} onCreated={onPress} /> : null}
++      <FlatList
++        style={{ flexGrow: 0, flexShrink: 1 }}
++        data={lists}
++        keyboardShouldPersistTaps="handled"
++        keyExtractor={list => list.id}
++        renderItem={({ item }) => musicInfo
++          ? <MusicPlaylistRow list={item} musicInfo={musicInfo} onPress={onPress} />
++          : <PlaylistRow list={item} onPress={onPress} disabled={false} />}
++        ListEmptyComponent={<Text style={{ padding: 20 }} color={colors.onSurfaceVariant}>{t('library_no_results')}</Text>}
++      />
++    </View>
++  )
++}
++
++const styles = createStyle({
++  container: { flexShrink: 1, paddingHorizontal: 20, paddingBottom: 20, minWidth: '90%' },
++  search: { flexDirection: 'row', alignItems: 'center', borderRadius: 28, paddingHorizontal: 16 },
++  input: { minHeight: 48, paddingLeft: 12 },
++  create: { minHeight: 56, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12 },
++  row: { minHeight: 64, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, borderRadius: 16, marginBottom: 8 },
++})
+diff --git a/src/components/common/Button.tsx b/src/components/common/Button.tsx
+index 59c4d8e..863e387 100644
+--- a/src/components/common/Button.tsx
++++ b/src/components/common/Button.tsx
+@@ -35,7 +35,7 @@ export default forwardRef<BtnType, BtnProps>(({ ripple: propsRipple = {}, disabl
+     <Pressable
+       android_ripple={ripple}
+       disabled={disabled}
+-      style={StyleSheet.compose({ opacity: disabled ? 0.3 : 1 }, style)}
++      style={StyleSheet.compose({ borderRadius: 24, overflow: 'hidden', opacity: disabled ? 0.38 : 1 }, style)}
+       {...props}
+       ref={btnRef}
+     >
+diff --git a/src/components/common/ButtonPrimary.tsx b/src/components/common/ButtonPrimary.tsx
+index 53fe510..de3e59c 100644
+--- a/src/components/common/ButtonPrimary.tsx
++++ b/src/components/common/ButtonPrimary.tsx
+@@ -22,8 +22,8 @@ export default memo(({ disabled, size = 14, onPress, children }: ButtonProps) =>
+ const styles = createStyle({
+   button: {
+     paddingHorizontal: 10,
+-    paddingVertical: 5,
+-    borderRadius: 4,
++    paddingVertical: 12,
++    borderRadius: 24,
+     marginRight: 10,
+   },
+ })
+diff --git a/src/components/common/ConfirmAlert.tsx b/src/components/common/ConfirmAlert.tsx
+index a7efc56..4c745dc 100644
+--- a/src/components/common/ConfirmAlert.tsx
++++ b/src/components/common/ConfirmAlert.tsx
+@@ -36,12 +36,12 @@ const styles = createStyle({
+   },
+   btn: {
+     flex: 1,
+-    paddingTop: 9,
+-    paddingBottom: 9,
++    paddingTop: 12,
++    paddingBottom: 12,
+     paddingLeft: 10,
+     paddingRight: 10,
+     alignItems: 'center',
+-    borderRadius: 4,
++    borderRadius: 24,
+   },
+   btnDirection: {
+     marginRight: 15,
+diff --git a/src/components/common/Dialog.tsx b/src/components/common/Dialog.tsx
+index 72eb01e..69370e0 100644
+--- a/src/components/common/Dialog.tsx
++++ b/src/components/common/Dialog.tsx
+@@ -9,7 +9,7 @@ import { useTheme } from '@/store/theme/hook'
+ import Text from './Text'
+ import { scaleSizeH } from '@/utils/pixelRatio'
+ 
+-const HEADER_HEIGHT = 20
++const HEADER_HEIGHT = 48
+ const styles = createStyle({
+   centeredView: {
+     flex: 1,
+@@ -17,11 +17,11 @@ const styles = createStyle({
+     alignItems: 'center',
+   },
+   modalView: {
+-    maxWidth: '90%',
+-    minWidth: '60%',
++    width: '90%',
++    maxWidth: 600,
+     maxHeight: '78%',
+     // backgroundColor: 'white',
+-    borderRadius: 4,
++    borderRadius: 28,
+     // shadowColor: '#000',
+     // shadowOffset: {
+     //   width: 0,
+@@ -29,25 +29,26 @@ const styles = createStyle({
+     // },
+     // shadowOpacity: 0.25,
+     // shadowRadius: 4,
+-    elevation: 3,
++    elevation: 6,
++    overflow: 'hidden',
+   },
+   header: {
+     flexGrow: 0,
+     flexShrink: 0,
+     flexDirection: 'row',
+-    borderTopLeftRadius: 4,
+-    borderTopRightRadius: 4,
++    borderTopLeftRadius: 28,
++    borderTopRightRadius: 28,
+     height: HEADER_HEIGHT,
+   },
+   title: {
+-    paddingLeft: 5,
+-    paddingRight: 25,
++    paddingLeft: 24,
++    paddingRight: 56,
+     lineHeight: HEADER_HEIGHT,
+   },
+   closeBtn: {
+     position: 'absolute',
+     right: 0,
+-    borderTopRightRadius: 4,
++    borderTopRightRadius: 28,
+     flexGrow: 0,
+     flexShrink: 0,
+     height: HEADER_HEIGHT,
+@@ -92,7 +93,7 @@ export default forwardRef<DialogType, DialogProps>(({
+   const closeBtnComponent = useMemo(() => {
+     return closeBtn
+       ? <TouchableHighlight style={{ ...styles.closeBtn, width: scaleSizeH(HEADER_HEIGHT) }} underlayColor={theme['c-primary-dark-200-alpha-600']} onPress={() => modalRef.current?.setVisible(false)}>
+-          <Icon name="close" color={theme['c-primary-dark-500-alpha-500']} size={10} />
++          <Icon name="close" color={theme['c-primary-dark-500-alpha-500']} size={18} />
+         </TouchableHighlight>
+       : null
+   }, [closeBtn, theme])
+@@ -101,8 +102,8 @@ export default forwardRef<DialogType, DialogProps>(({
+     <Modal onHide={onHide} keyHide={keyHide} bgHide={bgHide} bgColor="rgba(50,50,50,.3)" ref={modalRef}>
+       <View style={{ ...styles.centeredView, paddingBottom: keyboardShown ? keyboardHeight : 0 }}>
+         <View style={{ ...styles.modalView, height, backgroundColor: theme['c-content-background'] }} onStartShouldSetResponder={() => true}>
+-          <View style={{ ...styles.header, backgroundColor: theme['c-primary-light-100-alpha-100'] }}>
+-            <Text style={styles.title} size={13} color={theme['c-primary-light-1000']} numberOfLines={1}>{title}</Text>
++          <View style={{ ...styles.header, backgroundColor: theme['c-content-background'] }}>
++            <Text style={styles.title} size={20} color={theme['c-font']} numberOfLines={1}>{title}</Text>
+             {closeBtnComponent}
+           </View>
+           {children}
+diff --git a/src/components/player/PlayerBar/components/Pic.tsx b/src/components/player/PlayerBar/components/Pic.tsx
+index 1a14181..12a964f 100644
+--- a/src/components/player/PlayerBar/components/Pic.tsx
++++ b/src/components/player/PlayerBar/components/Pic.tsx
+@@ -15,7 +15,7 @@ const styles = StyleSheet.create({
+   image: {
+     width: PIC_HEIGHT,
+     height: PIC_HEIGHT,
+-    borderRadius: 2,
++    borderRadius: 16,
+   },
+ })
+ 
+diff --git a/src/components/player/PlayerBar/index.tsx b/src/components/player/PlayerBar/index.tsx
+index 610ffda..57a5a1b 100644
+--- a/src/components/player/PlayerBar/index.tsx
++++ b/src/components/player/PlayerBar/index.tsx
+@@ -1,5 +1,8 @@
+ import { memo, useMemo } from 'react'
+ import { View } from 'react-native'
++import FavoriteButton from '@/components/FavoriteButton'
++import { usePlayMusicInfo } from '@/store/player/hook'
++import { getMaterialColors } from '@/theme/material'
+ import { useKeyboard } from '@/utils/hooks'
+ 
+ import Pic from './components/Pic'
+@@ -12,6 +15,11 @@ import { useTheme } from '@/store/theme/hook'
+ import { useSettingValue } from '@/store/setting/hook'
+ 
+ 
++const PlayerFavorite = () => {
++  const { musicInfo } = usePlayMusicInfo()
++  return musicInfo ? <FavoriteButton musicInfo={musicInfo} /> : null
++}
++
+ export default memo(({ isHome = false }: { isHome?: boolean }) => {
+   // const { onLayout, ...layout } = useLayout()
+   const { keyboardShown } = useKeyboard()
+@@ -19,7 +27,7 @@ export default memo(({ isHome = false }: { isHome?: boolean }) => {
+   const autoHidePlayBar = useSettingValue('common.autoHidePlayBar')
+ 
+   const playerComponent = useMemo(() => (
+-    <View style={{ ...styles.container, backgroundColor: theme['c-content-background'] }}>
++    <View style={{ ...styles.container, backgroundColor: getMaterialColors(theme).surfaceContainer }}>
+       <Pic isHome={isHome} />
+       <View style={styles.center}>
+         <Title isHome={isHome} />
+@@ -29,6 +37,7 @@ export default memo(({ isHome = false }: { isHome?: boolean }) => {
+         <PlayInfo isHome={isHome} />
+       </View>
+       <View style={styles.right}>
++        <PlayerFavorite />
+         <ControlBtn />
+       </View>
+     </View>
+@@ -48,15 +57,15 @@ const styles = createStyle({
+     // marginTop: -progressContentPadding,
+     // backgroundColor: 'rgba(0, 0, 0, .1)',
+     // borderTopWidth: BorderWidths.normal2,
+-    paddingVertical: 5,
++    paddingVertical: 10,
+     paddingLeft: 5,
+     // backgroundColor: AppColors.primary,
+     // backgroundColor: 'red',
+-    borderTopLeftRadius: 6,
+-    borderTopRightRadius: 6,
++    borderTopLeftRadius: 24,
++    borderTopRightRadius: 24,
+     flexDirection: 'row',
+     alignItems: 'center',
+-    elevation: 10,
++    elevation: 3,
+   },
+   left: {
+     // borderRadius: 3,
+diff --git a/src/config/constant.ts b/src/config/constant.ts
+index b70b252..c160cbf 100644
+--- a/src/config/constant.ts
++++ b/src/config/constant.ts
+@@ -1,5 +1,5 @@
+ export const HEADER_HEIGHT = 42
+-export const LIST_ITEM_HEIGHT = 54
++export const LIST_ITEM_HEIGHT = 64
+ export const LIST_SCROLL_POSITION_KEY = '__LIST_SCROLL_POSITION_KEY__'
+ 
+ export const SPLIT_CHAR = {
+diff --git a/src/config/defaultSetting.ts b/src/config/defaultSetting.ts
+index 238de11..378b190 100644
+--- a/src/config/defaultSetting.ts
++++ b/src/config/defaultSetting.ts
+@@ -73,9 +73,9 @@ const defaultSetting: LX.AppSetting = {
+   'sync.enable': false,
+ 
+   // 'theme.id': 'blue_plus',
+-  'theme.id': 'green',
+-  'theme.lightId': 'green',
+-  'theme.darkId': 'black',
++  'theme.id': 'material',
++  'theme.lightId': 'material',
++  'theme.darkId': 'material_dark',
+   'theme.hideBgDark': false,
+   'theme.dynamicBg': false,
+   'theme.fontShadow': false,
+@@ -84,7 +84,6 @@ const defaultSetting: LX.AppSetting = {
+ 
+ // 使用新年皮肤
+ if (new Date().getMonth() < 2) {
+-  defaultSetting['theme.id'] = 'happy_new_year'
+   defaultSetting['desktopLyric.style.lyricPlayedColor'] = 'rgba(255, 18, 34, 1)'
+ }
+ 
+diff --git a/src/core/favorites.ts b/src/core/favorites.ts
+new file mode 100644
+index 0000000..1a9f9c6
+--- /dev/null
++++ b/src/core/favorites.ts
+@@ -0,0 +1,22 @@
++import { addListMusics, getListMusics, removeListMusics } from '@/core/list'
++import { LIST_IDS } from '@/config/constant'
++import settingState from '@/store/setting/state'
++
++const pending = new Map<string, Promise<boolean>>()
++
++// Multiple visible copies of the same song share one write while it is pending.
++export const toggleFavorite = (music: LX.Music.MusicInfo): Promise<boolean> => {
++  const previous = pending.get(music.id)
++  if (previous) return previous
++  const operation = (async() => {
++    const list = await getListMusics(LIST_IDS.LOVE)
++    const exists = list.some(item => item.id === music.id)
++    if (exists) await removeListMusics(LIST_IDS.LOVE, [music.id])
++    else await addListMusics(LIST_IDS.LOVE, [music], settingState.setting['list.addMusicLocationType'])
++    return !exists
++  })()
++  pending.set(music.id, operation)
++  const cleanup = () => { if (pending.get(music.id) === operation) pending.delete(music.id) }
++  void operation.then(cleanup, cleanup)
++  return operation
++}
+diff --git a/src/lang/en-us.json b/src/lang/en-us.json
+index 3d9be61..af909b7 100644
+--- a/src/lang/en-us.json
++++ b/src/lang/en-us.json
+@@ -518,5 +518,21 @@
+   "version_title_latest": "🎉 The current version is already the latest 🎊",
+   "version_title_new": "🌟 New version found 🌟",
+   "version_title_unknown": "❓ Failed to get the latest version information ❓",
+-  "version_title_update": "🚀 App update 🚀"
++  "version_title_update": "🚀 App update 🚀",
++  "library_title": "Your library",
++  "library_playlists": "My playlists",
++  "library_search_lists": "Search playlists",
++  "library_no_results": "No playlists found. Try another search.",
++  "library_favorite_removed": "Removed from favorites",
++  "library_unfavorite": "Remove from favorites",
++  "library_save_failed": "Could not save. Please try again.",
++  "library_create_add": "Create playlist and add",
++  "library_saved": "Already added",
++  "library_name_required": "Enter a playlist name",
++  "library_empty": "No songs here yet",
++  "library_empty_hint": "Tap a heart in search results to save favorites, or add songs using their menu.",
++  "library_song_count": "{num} songs",
++  "library_play_all": "Play all",
++  "library_open_lists": "Switch playlist",
++  "library_more": "More actions"
+ }
+diff --git a/src/lang/zh-cn.json b/src/lang/zh-cn.json
+index 683d8bf..87d77f3 100644
+--- a/src/lang/zh-cn.json
++++ b/src/lang/zh-cn.json
+@@ -518,5 +518,21 @@
+   "version_title_latest": "🎉 当前版本已是最新 🎊",
+   "version_title_new": "🌟 发现新版本 🌟",
+   "version_title_unknown": "❓ 获取最新版本信息失败 ❓",
+-  "version_title_update": "🚀 软件更新 🚀"
++  "version_title_update": "🚀 软件更新 🚀",
++  "library_title": "音乐库",
++  "library_playlists": "我的歌单",
++  "library_search_lists": "搜索歌单",
++  "library_no_results": "没有找到歌单，试试其他关键词",
++  "library_favorite_removed": "已取消收藏",
++  "library_unfavorite": "取消收藏",
++  "library_save_failed": "保存失败，请重试",
++  "library_create_add": "新建歌单并添加",
++  "library_saved": "已添加",
++  "library_name_required": "请输入歌单名称",
++  "library_empty": "这里还没有歌曲",
++  "library_empty_hint": "在搜索结果中轻点爱心收藏，或通过歌曲菜单添加到歌单",
++  "library_song_count": "{num} 首歌曲",
++  "library_play_all": "播放全部",
++  "library_open_lists": "切换歌单",
++  "library_more": "更多操作"
+ }
+diff --git a/src/lang/zh-tw.json b/src/lang/zh-tw.json
+index 2bec8f5..d8926aa 100644
+--- a/src/lang/zh-tw.json
++++ b/src/lang/zh-tw.json
+@@ -518,5 +518,21 @@
+   "version_title_latest": "🎉 目前版本已是最新 🎊",
+   "version_title_new": "🌟 發現新版本 🌟",
+   "version_title_unknown": "❓ 獲取最新版本資訊失敗 ❓",
+-  "version_title_update": "🚀 軟體更新 🚀"
++  "version_title_update": "🚀 軟體更新 🚀",
++  "library_title": "音樂庫",
++  "library_playlists": "我的歌單",
++  "library_search_lists": "搜尋歌單",
++  "library_no_results": "找不到歌單，試試其他關鍵字",
++  "library_favorite_removed": "已取消收藏",
++  "library_unfavorite": "取消收藏",
++  "library_save_failed": "儲存失敗，請重試",
++  "library_create_add": "新增歌單並加入",
++  "library_saved": "已加入",
++  "library_name_required": "請輸入歌單名稱",
++  "library_empty": "這裡還沒有歌曲",
++  "library_empty_hint": "在搜尋結果中輕點愛心收藏，或透過歌曲選單加入歌單",
++  "library_song_count": "{num} 首歌曲",
++  "library_play_all": "播放全部",
++  "library_open_lists": "切換歌單",
++  "library_more": "更多操作"
+ }
+diff --git a/src/screens/Home/Vertical/Header.tsx b/src/screens/Home/Vertical/Header.tsx
+index f2a89b4..6a84355 100644
+--- a/src/screens/Home/Vertical/Header.tsx
++++ b/src/screens/Home/Vertical/Header.tsx
+@@ -24,7 +24,7 @@ const headerComponents: Partial<Record<CommonState['navActiveId'], React.ReactNo
+ //   const id = useNavActiveId()
+ //   const t = useI18n()
+ 
+-//   return <Text style={styles.leftTitle} size={18}>{t(id)}</Text>
++//   return <Text style={styles.leftTitle} size={22}>{t(id)}</Text>
+ // }
+ const LeftHeader = () => {
+   const theme = useTheme()
+@@ -47,7 +47,7 @@ const LeftHeader = () => {
+           <Icon color={theme['c-font']} name="menu" size={18} />
+         </TouchableOpacity>
+         <TouchableOpacity style={styles.titleBtn} onPress={openMenu}>
+-          <Text style={styles.leftTitle} size={18}>{t(id)}</Text>
++          <Text style={styles.leftTitle} size={22}>{t(id)}</Text>
+         </TouchableOpacity>
+       </View>
+       {headerComponents[id] ?? null}
+@@ -64,7 +64,7 @@ const LeftHeader = () => {
+ //   const id = useNavActiveId()
+ //   const t = useI18n()
+ 
+-//   return <Text style={styles.rightTitle} size={18}>{t(id)}</Text>
++//   return <Text style={styles.rightTitle} size={22}>{t(id)}</Text>
+ // }
+ const RightHeader = () => {
+   const theme = useTheme()
+@@ -83,7 +83,7 @@ const RightHeader = () => {
+     }}>
+       <View style={styles.left}>
+         <TouchableOpacity style={styles.titleBtn} onPress={openMenu}>
+-          <Text style={styles.rightTitle} size={18}>{t(id)}</Text>
++          <Text style={styles.rightTitle} size={22}>{t(id)}</Text>
+         </TouchableOpacity>
+       </View>
+       {headerComponents[id] ?? null}
+@@ -146,12 +146,14 @@ const styles = createStyle({
+     justifyContent: 'center',
+   },
+   leftTitle: {
+-    paddingLeft: 14,
++    paddingLeft: 12,
+     paddingRight: 16,
++    fontWeight: '600',
+   },
+   rightTitle: {
+     paddingLeft: 16,
+     paddingRight: 16,
++    fontWeight: '600',
+   },
+ })
+ 
+diff --git a/src/screens/Home/Views/Mylist/MusicList/ActiveList.tsx b/src/screens/Home/Views/Mylist/MusicList/ActiveList.tsx
+index 02fabe3..9059e03 100644
+--- a/src/screens/Home/Views/Mylist/MusicList/ActiveList.tsx
++++ b/src/screens/Home/Views/Mylist/MusicList/ActiveList.tsx
+@@ -1,18 +1,17 @@
+-import { forwardRef, useEffect, useImperativeHandle, useMemo, useState } from 'react'
+-import { TouchableOpacity } from 'react-native'
+-
++import { forwardRef, useEffect, useImperativeHandle, useState } from 'react'
++import { View, TouchableOpacity } from 'react-native'
+ import { Icon } from '@/components/common/Icon'
+-import { BorderWidths } from '@/theme'
+ import { useTheme } from '@/store/theme/hook'
+-import { useActiveListId, useListFetching } from '@/store/list/hook'
+-import listState from '@/store/list/state'
++import { useActiveListId, useListFetching, useMyList, useListMusicCount } from '@/store/list/hook'
+ import { createStyle } from '@/utils/tools'
+ import { getListPrevSelectId } from '@/utils/data'
+ import { setActiveList } from '@/core/list'
++import { playList } from '@/core/player/player'
+ import Text from '@/components/common/Text'
+ import { LIST_IDS } from '@/config/constant'
+ import Loading from '@/components/common/Loading'
+-import { useSettingValue } from '@/store/setting/hook'
++import { useI18n } from '@/lang'
++import { getMaterialColors } from '@/theme/material'
+ 
+ export interface ActiveListProps {
+   onShowSearchBar: () => void
+@@ -23,85 +22,40 @@ export interface ActiveListType {
+ }
+ 
+ export default forwardRef<ActiveListType, ActiveListProps>(({ onShowSearchBar, onScrollToTop }, ref) => {
+-  const theme = useTheme()
+-  const currentListId = useActiveListId()
+-  const fetching = useListFetching(currentListId)
+-  const langId = useSettingValue('common.langId')
+-  const currentListName = useMemo(() => {
+-    switch (currentListId) {
+-      case LIST_IDS.TEMP:
+-        return global.i18n.t('list_name_temp')
+-      case LIST_IDS.DEFAULT:
+-        return global.i18n.t('list_name_default')
+-      case LIST_IDS.LOVE:
+-        return global.i18n.t('list_name_love')
+-      default:
+-        return listState.allList.find(l => l.id === currentListId)?.name ?? ''
+-    }
+-  // eslint-disable-next-line react-hooks/exhaustive-deps
+-  }, [currentListId, langId])
+-  const [visibleBar, setVisibleBar] = useState(true)
+-
+-  useImperativeHandle(ref, () => ({
+-    setVisibleBar(visible) {
+-      setVisibleBar(visible)
+-    },
+-  }))
+-
+-  const showList = () => {
+-    global.app_event.changeLoveListVisible(true)
+-  }
+-
+-  useEffect(() => {
+-    void getListPrevSelectId().then((id) => {
+-      setActiveList(id)
+-    })
+-  }, [])
++  const colors = getMaterialColors(useTheme())
++  const id = useActiveListId()
++  const lists = useMyList()
++  const count = useListMusicCount(id)
++  const fetching = useListFetching(id)
++  const t = useI18n()
++  const name = id === LIST_IDS.TEMP ? t('list_name_temp') : lists.find(list => list.id === id)?.name ?? ''
++  const [visible, setVisible] = useState(true)
++  useImperativeHandle(ref, () => ({ setVisibleBar: setVisible }))
++  useEffect(() => { void getListPrevSelectId().then(setActiveList) }, [])
+ 
+   return (
+-    <TouchableOpacity onPress={showList} onLongPress={onScrollToTop} style={{ ...styles.currentList, opacity: visibleBar ? 1 : 0, borderBottomColor: theme['c-border-background'] }}>
+-      <Icon style={styles.currentListIcon} color={theme['c-button-font']} name="chevron-right" size={12} />
+-      { fetching ? <Loading color={theme['c-button-font']} style={styles.loading} /> : null }
+-      <Text style={styles.currentListText} numberOfLines={1} color={theme['c-button-font']}>{currentListName}</Text>
+-      <TouchableOpacity style={styles.currentListBtns} onPress={onShowSearchBar}>
+-        <Icon color={theme['c-button-font']} name="search-2" />
++    <View pointerEvents={visible ? 'auto' : 'none'} style={{ ...styles.container, opacity: visible ? 1 : 0, backgroundColor: colors.surface }}>
++      <TouchableOpacity style={styles.title} onPress={() => { global.app_event.changeLoveListVisible(true) }} onLongPress={onScrollToTop} accessibilityRole="button" accessibilityLabel={t('library_open_lists') + ' · ' + name}>
++        <Icon name={id === LIST_IDS.LOVE ? 'love' : 'album'} color={colors.primary} size={24} />
++        <View style={{ flex: 1, marginLeft: 12 }}>
++          <Text numberOfLines={1} size={18} style={{ fontWeight: '600' }}>{name}</Text>
++          {count !== null ? <Text size={12} color={colors.onSurfaceVariant}>{t('library_song_count', { num: count })}</Text> : null}
++        </View>
++        <Icon name="chevron-right" color={colors.onSurfaceVariant} size={12} />
+       </TouchableOpacity>
+-    </TouchableOpacity>
++      {fetching ? <Loading color={colors.primary} /> : null}
++      <TouchableOpacity style={styles.action} onPress={onShowSearchBar} accessibilityRole="button" accessibilityLabel={t('nav_search')}>
++        <Icon color={colors.onSurfaceVariant} name="search-2" size={20} />
++      </TouchableOpacity>
++      <TouchableOpacity style={{ ...styles.action, borderRadius: 24, backgroundColor: colors.container, opacity: count ? 1 : 0.4 }} disabled={!count || fetching} onPress={() => { void playList(id, 0) }} accessibilityRole="button" accessibilityLabel={t('library_play_all')} accessibilityState={{ disabled: !count || fetching }}>
++        <Icon color={colors.onContainer} name="play" size={18} />
++      </TouchableOpacity>
++    </View>
+   )
+ })
+ 
+-
+ const styles = createStyle({
+-  currentList: {
+-    flexDirection: 'row',
+-    paddingRight: 2,
+-    height: 36,
+-    alignItems: 'center',
+-    borderBottomWidth: BorderWidths.normal,
+-    // backgroundColor: 'rgba(0,0,0,0.2)',
+-  },
+-  currentListIcon: {
+-    paddingLeft: 15,
+-    paddingRight: 10,
+-    // paddingTop: 10,
+-    // paddingBottom: 0,
+-  },
+-  currentListText: {
+-    flex: 1,
+-    // minWidth: 70,
+-    // paddingLeft: 10,
+-    paddingRight: 10,
+-    // paddingTop: 10,
+-    // paddingBottom: 10,
+-  },
+-  loading: {
+-    marginRight: 5,
+-  },
+-  currentListBtns: {
+-    width: 46,
+-    justifyContent: 'center',
+-    alignItems: 'center',
+-    height: '100%',
+-    // backgroundColor: 'rgba(0,0,0,0.2)',
+-  },
++  container: { minHeight: 76, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12 },
++  title: { flex: 1, minHeight: 64, flexDirection: 'row', alignItems: 'center' },
++  action: { width: 48, height: 48, alignItems: 'center', justifyContent: 'center', marginLeft: 4 },
+ })
+diff --git a/src/screens/Home/Views/Mylist/MusicList/List.tsx b/src/screens/Home/Views/Mylist/MusicList/List.tsx
+index 98c5371..c4b6ea8 100644
+--- a/src/screens/Home/Views/Mylist/MusicList/List.tsx
++++ b/src/screens/Home/Views/Mylist/MusicList/List.tsx
+@@ -15,6 +15,9 @@ import type { SelectMode } from './MultipleModeBar'
+ import { useActiveListId } from '@/store/list/hook'
+ import { useSettingValue } from '@/store/setting/hook'
+ 
++import Text from '@/components/common/Text'
++import { useI18n } from '@/lang'
++
+ type FlatListType = FlatListProps<LX.Music.MusicInfo>
+ 
+ export interface ListProps {
+@@ -45,7 +48,7 @@ const usePlayIndex = () => {
+ 
+ 
+ const List = forwardRef<ListType, ListProps>(({ onShowMenu, onMuiltSelectMode, onSelectAll }, ref) => {
+-  // const t = useI18n()
++  const t = useI18n()
+   const flatListRef = useRef<FlatList>(null)
+   const [currentList, setList] = useState<LX.List.ListMusics>([])
+   const listFirstScrollRef = useRef(false)
+@@ -283,6 +286,12 @@ const List = forwardRef<ListType, ListProps>(({ onShowMenu, onMuiltSelectMode, o
+       initialNumToRender={12}
+       renderItem={renderItem}
+       keyExtractor={getkey}
++      ListEmptyComponent={
++        <View style={{ paddingHorizontal: 32, paddingVertical: 64, alignItems: 'center' }}>
++          <Text size={20} style={{ marginBottom: 12 }}>{t('library_empty')}</Text>
++          <Text size={14} style={{ textAlign: 'center', opacity: 0.7 }}>{t('library_empty_hint')}</Text>
++        </View>
++      }
+       extraData={activeIndex}
+       getItemLayout={getItemLayout}
+     />
+diff --git a/src/screens/Home/Views/Mylist/MusicList/ListItem.tsx b/src/screens/Home/Views/Mylist/MusicList/ListItem.tsx
+index 824c245..4d0d630 100644
+--- a/src/screens/Home/Views/Mylist/MusicList/ListItem.tsx
++++ b/src/screens/Home/Views/Mylist/MusicList/ListItem.tsx
+@@ -9,6 +9,7 @@ import { useAssertApiSupport } from '@/store/common/hook'
+ import { scaleSizeH } from '@/utils/pixelRatio'
+ import Text from '@/components/common/Text'
+ import Badge from '@/components/common/Badge'
++import FavoriteButton from '@/components/FavoriteButton'
+ 
+ export const ITEM_HEIGHT = scaleSizeH(LIST_ITEM_HEIGHT)
+ 
+@@ -49,7 +50,7 @@ export default memo(({ item, index, activeIndex, onPress, onShowMenu, onLongPres
+         {
+           active
+             ? <Icon style={styles.sn} name="play-outline" size={13} color={theme['c-primary-font']} />
+-            : <Text style={styles.sn} size={13} color={theme['c-300']}>{index + 1}</Text>
++            : <Text style={styles.sn} size={13} color={theme['c-font-label']}>{index + 1}</Text>
+         }
+         <View style={styles.itemInfo}>
+           {/* <View style={styles.listItemTitle}> */}
+@@ -57,20 +58,21 @@ export default memo(({ item, index, activeIndex, onPress, onShowMenu, onLongPres
+           {/* </View> */}
+           <View style={styles.listItemSingle}>
+             <Badge>{item.source.toUpperCase()}</Badge>
+-            <Text style={styles.listItemSingleText} size={11} color={active ? theme['c-primary-alpha-200'] : theme['c-500']} numberOfLines={1}>
++            <Text style={styles.listItemSingleText} size={12} color={active ? theme['c-primary-alpha-200'] : theme['c-font-label']} numberOfLines={1}>
+               {singer}
+             </Text>
+           </View>
+         </View>
+         {
+           isShowInterval ? (
+-            <Text size={12} color={active ? theme['c-primary-alpha-400'] : theme['c-250']} numberOfLines={1}>{item.interval}</Text>
++            <Text size={12} color={active ? theme['c-primary-alpha-400'] : theme['c-font-label']} numberOfLines={1}>{item.interval}</Text>
+           ) : null
+         }
+       </TouchableOpacity>
+       {/* <View style={styles.listItemRight}> */}
+-      <TouchableOpacity onPress={handleShowMenu} ref={moreButtonRef} style={styles.moreButton}>
+-        <Icon name="dots-vertical" style={{ color: theme['c-350'] }} size={12} />
++      <FavoriteButton musicInfo={item} />
++      <TouchableOpacity accessibilityRole="button" accessibilityLabel={item.name + ' · ' + global.i18n.t('library_more')} onPress={handleShowMenu} ref={moreButtonRef} style={styles.moreButton}>
++        <Icon name="dots-vertical" style={{ color: theme['c-font-label'] }} size={18} />
+       </TouchableOpacity>
+       {/* </View> */}
+     </View>
+@@ -149,7 +151,7 @@ const styles = createStyle({
+   },
+ 
+   moreButton: {
+-    height: '80%',
++    height: 48,
+     paddingLeft: 16,
+     paddingRight: 16,
+     // paddingTop: 10,
+diff --git a/src/screens/Home/Views/Mylist/MyList/List.tsx b/src/screens/Home/Views/Mylist/MyList/List.tsx
+index 26695ce..b6fce4d 100644
+--- a/src/screens/Home/Views/Mylist/MyList/List.tsx
++++ b/src/screens/Home/Views/Mylist/MyList/List.tsx
+@@ -1,190 +1,101 @@
+-import { memo, useEffect, useRef } from 'react'
+-import { View, TouchableOpacity, FlatList, type NativeScrollEvent, type NativeSyntheticEvent, type FlatListProps } from 'react-native'
+-
++import { memo, useRef, useState } from 'react'
++import { View, TouchableOpacity, FlatList } from 'react-native'
+ import { Icon } from '@/components/common/Icon'
+-
++import Input from '@/components/common/Input'
++import Text from '@/components/common/Text'
++import Button from '@/components/common/Button'
+ import { useTheme } from '@/store/theme/hook'
+-import { useActiveListId, useListFetching, useMyList } from '@/store/list/hook'
++import { useActiveListId, useListFetching, useMyList, useListMusicCount } from '@/store/list/hook'
+ import { createStyle } from '@/utils/tools'
+-import { LIST_SCROLL_POSITION_KEY } from '@/config/constant'
+-import { getListPosition, saveListPosition } from '@/utils/data'
+ import { setActiveList } from '@/core/list'
+-import Text from '@/components/common/Text'
+ import { type Position } from './ListMenu'
+-import { scaleSizeH } from '@/utils/pixelRatio'
+ import Loading from '@/components/common/Loading'
++import { LIST_IDS } from '@/config/constant'
++import { useI18n } from '@/lang'
++import { filterPlaylists } from '@/utils/playlist'
++import { getMaterialColors } from '@/theme/material'
+ 
+-type FlatListType = FlatListProps<LX.List.MyListInfo>
+-
+-const ITEM_HEIGHT = scaleSizeH(40)
+-
+-const ListItem = memo(({ item, index, activeId, onPress, onShowMenu }: {
+-  onPress: (item: LX.List.MyListInfo) => void
+-  index: number
+-  activeId: string
++const ListItem = memo(({ item, activeId, onPress, onShowMenu }: {
+   item: LX.List.MyListInfo
+-  onShowMenu: (item: LX.List.MyListInfo, index: number, position: { x: number, y: number, w: number, h: number }) => void
++  activeId: string
++  onPress: (item: LX.List.MyListInfo) => void
++  onShowMenu: (item: LX.List.MyListInfo, position: Position) => void
+ }) => {
+-  const theme = useTheme()
++  const colors = getMaterialColors(useTheme())
+   const moreButtonRef = useRef<TouchableOpacity>(null)
+   const fetching = useListFetching(item.id)
+-
+-  const active = activeId == item.id
+-
++  const count = useListMusicCount(item.id)
++  const active = activeId === item.id
++  const t = useI18n()
+   const handleShowMenu = () => {
+-    if (moreButtonRef.current?.measure) {
+-      moreButtonRef.current.measure((fx, fy, width, height, px, py) => {
+-        // console.log(fx, fy, width, height, px, py)
+-        onShowMenu(item, index, { x: Math.ceil(px), y: Math.ceil(py), w: Math.ceil(width), h: Math.ceil(height) })
+-      })
+-    }
+-  }
+-
+-  const handlePress = () => {
+-    onPress(item)
++    moreButtonRef.current?.measure((fx, fy, width, height, px, py) => {
++      onShowMenu(item, { x: Math.ceil(px), y: Math.ceil(py), w: Math.ceil(width), h: Math.ceil(height) })
++    })
+   }
+-
+   return (
+-    <View style={{ ...styles.listItem, height: ITEM_HEIGHT }}>
+-      {
+-        active
+-          ? <Icon style={styles.listActiveIcon} name="chevron-right" size={12} color={theme['c-primary-font']} />
+-          : null
+-      }
+-      { fetching ? <Loading color={active ? theme['c-primary-font'] : theme['c-font']} style={styles.loading} /> : null }
+-      <TouchableOpacity style={styles.listName} onPress={handlePress}>
+-        <Text numberOfLines={1} color={active ? theme['c-primary-font'] : theme['c-font']}>{item.name}</Text>
++    <View style={{ ...styles.row, backgroundColor: active ? colors.container : 'transparent' }}>
++      <TouchableOpacity style={styles.name} onPress={() => { onPress(item) }} accessibilityRole="button" accessibilityState={{ selected: active }} accessibilityLabel={item.name}>
++        <View style={{ ...styles.artwork, backgroundColor: colors.surfaceContainer }}>
++          <Icon name={item.id === LIST_IDS.LOVE ? 'love' : item.id === LIST_IDS.DEFAULT ? 'music_time' : 'album'} size={24} color={colors.primary} />
++        </View>
++        <View style={{ flex: 1 }}>
++          <Text numberOfLines={1} color={active ? colors.onContainer : colors.onSurface}>{item.name}</Text>
++          {count !== null ? <Text size={12} color={active ? colors.onContainer : colors.onSurfaceVariant}>{t('library_song_count', { num: count })}</Text> : null}
++        </View>
+       </TouchableOpacity>
+-      <TouchableOpacity onPress={handleShowMenu} ref={moreButtonRef} style={styles.listMoreBtn}>
+-        <Icon name="dots-vertical" color={theme['c-350']} size={12} />
++      {fetching ? <Loading color={colors.primary} /> : null}
++      <TouchableOpacity onPress={handleShowMenu} ref={moreButtonRef} style={styles.more} accessibilityRole="button" accessibilityLabel={item.name + ' · ' + t('library_more')}>
++        <Icon name="dots-vertical" color={active ? colors.onContainer : colors.onSurfaceVariant} size={18} />
+       </TouchableOpacity>
+     </View>
+   )
+-}, (prevProps, nextProps) => {
+-  return !!(prevProps.item === nextProps.item &&
+-    prevProps.index === nextProps.index &&
+-    prevProps.item.name == nextProps.item.name &&
+-    prevProps.activeId != nextProps.item.id &&
+-    nextProps.activeId != nextProps.item.id
+-  )
+ })
+ 
+-
+-export default ({ onShowMenu }: {
++export default ({ onShowMenu, onNew }: {
+   onShowMenu: (info: { listInfo: LX.List.MyListInfo, index: number }, position: Position) => void
++  onNew: (position: number) => void
+ }) => {
+-  const flatListRef = useRef<FlatList>(null)
+   const allList = useMyList()
+-  const activeListId = useActiveListId()
+-
+-  const handleToggleList = (item: LX.List.MyListInfo) => {
+-    // setVisiblePanel(false)
++  const activeId = useActiveListId()
++  const [keyword, setKeyword] = useState('')
++  const colors = getMaterialColors(useTheme())
++  const t = useI18n()
++  const handleToggle = (item: LX.List.MyListInfo) => {
++    setActiveList(item.id)
+     global.app_event.changeLoveListVisible(false)
+-    requestAnimationFrame(() => {
+-      setActiveList(item.id)
+-    })
+-  }
+-
+-
+-  const handleScroll = ({ nativeEvent }: NativeSyntheticEvent<NativeScrollEvent>) => {
+-    void saveListPosition(LIST_SCROLL_POSITION_KEY, nativeEvent.contentOffset.y)
+   }
+-
+-  const showMenu = (listInfo: LX.List.MyListInfo, index: number, position: Position) => {
+-    onShowMenu({ listInfo, index }, position)
+-  }
+-
+-  useEffect(() => {
+-    void getListPosition(LIST_SCROLL_POSITION_KEY).then((offset) => {
+-      flatListRef.current?.scrollToOffset({ offset, animated: false })
+-    })
+-  }, [])
+-
+-  const renderItem: FlatListType['renderItem'] = ({ item, index }) => (
+-    <ListItem
+-      key={item.id}
+-      item={item}
+-      index={index}
+-      activeId={activeListId}
+-      onPress={handleToggleList}
+-      onShowMenu={showMenu}
+-    />
+-  )
+-  const getkey: FlatListType['keyExtractor'] = item => item.id
+-  const getItemLayout: FlatListType['getItemLayout'] = (data, index) => {
+-    return { length: ITEM_HEIGHT, offset: ITEM_HEIGHT * index, index }
+-  }
+-
+   return (
+-    <FlatList
+-      ref={flatListRef}
+-      onScroll={handleScroll}
+-      style={styles.container}
+-      data={allList}
+-      maxToRenderPerBatch={9}
+-      // updateCellsBatchingPeriod={80}
+-      windowSize={9}
+-      removeClippedSubviews={true}
+-      initialNumToRender={18}
+-      renderItem={renderItem}
+-      keyExtractor={getkey}
+-      // extraData={activeIndex}
+-      getItemLayout={getItemLayout}
+-    />
++    <View style={{ flex: 1, padding: 16, backgroundColor: colors.surface }}>
++      <Text size={26} style={{ fontWeight: '600', marginVertical: 16 }}>{t('library_title')}</Text>
++      <View style={{ ...styles.search, backgroundColor: colors.surfaceContainer }}>
++        <Icon name="search-2" color={colors.onSurfaceVariant} size={18} />
++        <Input value={keyword} onChangeText={setKeyword} placeholder={t('library_search_lists')} accessibilityLabel={t('library_search_lists')} clearBtn style={{ minHeight: 48, paddingLeft: 12 }} />
++      </View>
++      <View style={styles.heading}>
++        <Text size={14} color={colors.onSurfaceVariant}>{t('library_playlists')}</Text>
++        <Button style={styles.newButton} onPress={() => { onNew(Math.max(0, allList.length - 2)) }} accessibilityRole="button" accessibilityLabel={t('list_create')}>
++          <Icon name="add_folder" color={colors.primary} size={18} />
++          <Text size={14} color={colors.primary} style={{ marginLeft: 8 }}>{t('list_create')}</Text>
++        </Button>
++      </View>
++      <FlatList
++        data={filterPlaylists(allList, keyword)}
++        keyboardShouldPersistTaps="handled"
++        keyExtractor={item => item.id}
++        extraData={activeId}
++        renderItem={({ item }) => <ListItem item={item} activeId={activeId} onPress={handleToggle} onShowMenu={(listInfo, position) => { onShowMenu({ listInfo, index: allList.findIndex(list => list.id === listInfo.id) }, position) }} />}
++        ListEmptyComponent={<Text style={{ padding: 20 }} color={colors.onSurfaceVariant}>{t('library_no_results')}</Text>}
++      />
++    </View>
+   )
+ }
+ 
+-
+ const styles = createStyle({
+-  container: {
+-    flexShrink: 1,
+-    flexGrow: 0,
+-  },
+-  // listContainer: {
+-  //   // borderBottomWidth: BorderWidths.normal2,
+-  // },
+-
+-  listItem: {
+-    height: 'auto',
+-    flexDirection: 'row',
+-    alignItems: 'center',
+-    paddingRight: 5,
+-    paddingLeft: 5,
+-    // borderBottomWidth: BorderWidths.normal,
+-  },
+-  listActiveIcon: {
+-    // width: 18,
+-    marginLeft: 3,
+-    // paddingRight: 5,
+-    textAlign: 'center',
+-  },
+-  loading: {
+-    marginLeft: 5,
+-  },
+-  listName: {
+-    height: '100%',
+-    // height: 46,
+-    // paddingTop: 12,
+-    // paddingBottom: 12,
+-    justifyContent: 'center',
+-    flexGrow: 1,
+-    flexShrink: 1,
+-    paddingLeft: 5,
+-    // backgroundColor: 'rgba(0,0,0,0.1)',
+-  },
+-  // listNameText: {
+-  //   // height: 46,
+-  //   fontSize: 14,
+-  // },
+-  listMoreBtn: {
+-    height: '100%',
+-    width: 36,
+-    // height: 46,
+-    // paddingTop: 12,
+-    // paddingBottom: 12,
+-    justifyContent: 'center',
+-    alignItems: 'center',
+-    // backgroundColor: 'rgba(0,0,0,0.1)',
+-  },
++  row: { minHeight: 76, flexDirection: 'row', alignItems: 'center', borderRadius: 20, marginBottom: 6 },
++  name: { flex: 1, minHeight: 76, flexDirection: 'row', alignItems: 'center', paddingLeft: 8 },
++  artwork: { width: 48, height: 48, borderRadius: 16, alignItems: 'center', justifyContent: 'center', marginRight: 12 },
++  more: { width: 48, height: 48, alignItems: 'center', justifyContent: 'center' },
++  search: { borderRadius: 28, paddingHorizontal: 16, flexDirection: 'row', alignItems: 'center' },
++  heading: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginVertical: 8 },
++  newButton: { minHeight: 48, paddingHorizontal: 12, flexDirection: 'row', alignItems: 'center', borderRadius: 24 },
+ })
+-
+diff --git a/src/screens/Home/Views/Mylist/MyList/ListNameEdit.tsx b/src/screens/Home/Views/Mylist/MyList/ListNameEdit.tsx
+index 29f5e95..8f65e0f 100644
+--- a/src/screens/Home/Views/Mylist/MyList/ListNameEdit.tsx
++++ b/src/screens/Home/Views/Mylist/MyList/ListNameEdit.tsx
+@@ -4,142 +4,72 @@ import Text from '@/components/common/Text'
+ import { View } from 'react-native'
+ import Input, { type InputType } from '@/components/common/Input'
+ import { createUserList, updateUserList } from '@/core/list'
+-import { confirmDialog, createStyle } from '@/utils/tools'
++import { confirmDialog } from '@/utils/tools'
+ import { useTheme } from '@/store/theme/hook'
++import { getMaterialColors } from '@/theme/material'
+ import listState from '@/store/list/state'
+-
+-interface NameInputType {
+-  setName: (text: string) => void
+-  getText: () => string
+-  focus: () => void
+-}
+-const NameInput = forwardRef<NameInputType, {}>((props, ref) => {
+-  const theme = useTheme()
+-  const [text, setText] = useState('')
+-  const [placeholder, setPlaceholder] = useState('')
+-  const inputRef = useRef<InputType>(null)
+-
+-  useImperativeHandle(ref, () => ({
+-    getText() {
+-      return text.trim()
+-    },
+-    setName(text) {
+-      setText(text)
+-      setPlaceholder(text || global.i18n.t('list_create_input_placeholder'))
+-    },
+-    focus() {
+-      inputRef.current?.focus()
+-    },
+-  }))
+-
+-  return (
+-    <Input
+-      ref={inputRef}
+-      placeholder={placeholder}
+-      value={text}
+-      onChangeText={setText}
+-      style={{ ...styles.input, backgroundColor: theme['c-primary-input-background'] }}
+-    />
+-  )
+-})
+-
++import { useI18n } from '@/lang'
+ 
+ export interface ListNameEditType {
+   showCreate: (position: number) => void
+   show: (listInfo: LX.List.UserListInfo) => void
+ }
+-const initSelectInfo = {}
+-
+ 
+ export default forwardRef<ListNameEditType, {}>((props, ref) => {
+   const alertRef = useRef<ConfirmAlertType>(null)
+-  const nameInputRef = useRef<NameInputType>(null)
+-  const [position, setPosition] = useState(0)
+-  const selectedListInfo = useRef<LX.List.UserListInfo>(initSelectInfo as LX.List.UserListInfo)
+-  const [visible, setVisible] = useState(false)
++  const inputRef = useRef<InputType>(null)
++  const selectedRef = useRef<LX.List.UserListInfo | null>(null)
++  const positionRef = useRef(0)
++  const submitting = useRef(false)
++  const [text, setText] = useState('')
++  const [creating, setCreating] = useState(true)
++  const [busy, setBusy] = useState(false)
++  const [error, setError] = useState('')
++  const colors = getMaterialColors(useTheme())
++  const t = useI18n()
+ 
+-  const handleShow = () => {
++  const show = (list: LX.List.UserListInfo | null, position: number) => {
++    if (submitting.current) return
++    selectedRef.current = list
++    positionRef.current = position
++    setCreating(!list)
++    setText(list?.name ?? '')
++    setError('')
+     alertRef.current?.setVisible(true)
+-    const name = position == -1 ? '' : (selectedListInfo.current.name ?? '')
+-    requestAnimationFrame(() => {
+-      nameInputRef.current?.setName(name)
+-      setTimeout(() => {
+-        nameInputRef.current?.focus()
+-      }, 300)
+-    })
++    requestAnimationFrame(() => { inputRef.current?.focus() })
+   }
+   useImperativeHandle(ref, () => ({
+-    showCreate(position) {
+-      setPosition(position)
+-      if (visible) handleShow()
+-      else {
+-        setVisible(true)
+-        requestAnimationFrame(() => {
+-          handleShow()
+-        })
+-      }
+-    },
+-    show(listInfo) {
+-      setPosition(-1)
+-      selectedListInfo.current = listInfo
+-      if (visible) handleShow()
+-      else {
+-        setVisible(true)
+-        requestAnimationFrame(() => {
+-          handleShow()
+-        })
+-      }
+-    },
++    showCreate(position) { show(null, position) },
++    show(list) { show(list, 0) },
+   }))
+ 
+-  const handleRename = () => {
+-    let name = nameInputRef.current?.getText() ?? ''
+-    if (!name.length) return
+-    if (name.length > 100) name = name.substring(0, 100)
+-    if (position == -1) {
+-      void updateUserList([{ ...selectedListInfo.current, name }])
+-    } else {
+-      void (listState.userList.some(l => l.name == name) ? confirmDialog({
+-        message: global.i18n.t('list_duplicate_tip'),
+-      }) : Promise.resolve(true)).then(confirmed => {
+-        if (!confirmed) return
++  const submit = async() => {
++    if (submitting.current) return
++    const name = text.trim().slice(0, 100)
++    if (!name) { setError(t('library_name_required')); return }
++    submitting.current = true
++    setBusy(true)
++    const selected = selectedRef.current
++    try {
++      if (listState.userList.some(l => l.name === name && l.id !== selected?.id) && !(await confirmDialog({ message: t('list_duplicate_tip') }))) return
++      if (selected) await updateUserList([{ ...selected, name }])
++      else {
+         const now = Date.now()
+-        void createUserList(position, [{ id: `userlist_${now}`, name, locationUpdateTime: now }])
+-      })
++        await createUserList(positionRef.current, [{ id: `userlist_${now}_${Math.random().toString(36).slice(2, 8)}`, name, locationUpdateTime: now }])
++      }
++      alertRef.current?.setVisible(false)
++    } catch { setError(t('library_save_failed')) } finally {
++      submitting.current = false
++      setBusy(false)
+     }
+-    alertRef.current?.setVisible(false)
+   }
+ 
+   return (
+-    visible
+-      ? <ConfirmAlert
+-          ref={alertRef}
+-          onConfirm={handleRename}
+-        >
+-          <View style={styles.renameContent}>
+-            <Text style={{ marginBottom: 5 }}>{ position == -1 ? global.i18n.t('list_rename_title') : global.i18n.t('list_create')}</Text>
+-            <NameInput ref={nameInputRef} />
+-          </View>
+-        </ConfirmAlert>
+-      : null
++    <ConfirmAlert ref={alertRef} onConfirm={submit} title={t(creating ? 'list_create' : 'list_rename_title')} disabledConfirm={busy || !text.trim()} keyHide={!busy} bgHide={!busy} closeBtn={!busy}>
++      <View>
++        <Input ref={inputRef} value={text} onChangeText={value => { setText(value); setError('') }} editable={!busy} maxLength={100} accessibilityLabel={t('list_create_input_placeholder')} placeholder={t('list_create_input_placeholder')} returnKeyType="done" onSubmitEditing={submit} style={{ minHeight: 56, borderRadius: 16, paddingHorizontal: 16, backgroundColor: colors.surfaceContainer }} />
++        {error ? <Text accessibilityLiveRegion="polite" style={{ marginTop: 12 }}>{error}</Text> : null}
++      </View>
++    </ConfirmAlert>
+   )
+ })
+-
+-
+-const styles = createStyle({
+-  renameContent: {
+-    flexGrow: 1,
+-    flexShrink: 1,
+-    flexDirection: 'column',
+-  },
+-  input: {
+-    flexGrow: 1,
+-    flexShrink: 1,
+-    minWidth: 290,
+-    borderRadius: 4,
+-    // paddingTop: 2,
+-    // paddingBottom: 2,
+-  },
+-})
+-
+-
+diff --git a/src/screens/Home/Views/Mylist/MyList/index.tsx b/src/screens/Home/Views/Mylist/MyList/index.tsx
+index 93fc752..7795f0b 100644
+--- a/src/screens/Home/Views/Mylist/MyList/index.tsx
++++ b/src/screens/Home/Views/Mylist/MyList/index.tsx
+@@ -37,7 +37,7 @@ export default () => {
+   return (
+     visible
+       ? <>
+-          <List onShowMenu={(info, position) => listMenuRef.current?.show(info, position)} />
++          <List onShowMenu={(info, position) => listMenuRef.current?.show(info, position)} onNew={position => listNameEditRef.current?.showCreate(position)} />
+           <ListNameEdit ref={listNameEditRef} />
+           <ListMusicSort ref={listMusicSortRef} />
+           <DuplicateMusic ref={duplicateMusicRef} />
+diff --git a/src/store/list/hook.ts b/src/store/list/hook.ts
+index 16ed625..4185a69 100644
+--- a/src/store/list/hook.ts
++++ b/src/store/list/hook.ts
+@@ -74,9 +74,26 @@ export const useMusicExistsList = (list: LX.List.MyListInfo, musicInfo: LX.Music
+   const [isExists, setExists] = useState(false)
+ 
+   useEffect(() => {
+-    void getListMusics(list.id).then((musics) => {
+-      setExists(musics.some(s => s.id == musicInfo.id))
+-    })
++    let disposed = false
++    let revision = 0
++    const refresh = () => {
++      const request = ++revision
++      void getListMusics(list.id).then((musics) => {
++        if (!disposed && request === revision) setExists(musics.some(s => s.id === musicInfo.id))
++      }).catch(() => {
++        if (!disposed && request === revision) setExists(false)
++      })
++    }
++    const handleUpdate = (ids: string[]) => {
++      if (ids.includes(list.id)) refresh()
++    }
++    setExists(false)
++    global.app_event.on('myListMusicUpdate', handleUpdate)
++    refresh()
++    return () => {
++      disposed = true
++      global.app_event.off('myListMusicUpdate', handleUpdate)
++    }
+   }, [list.id, musicInfo.id])
+ 
+   return isExists
+@@ -101,3 +118,27 @@ export const useListFetching = (listId: string) => {
+   return fetching
+ }
+ 
++export const useListMusicCount = (listId: string) => {
++  const [count, setCount] = useState<number | null>(null)
++  useEffect(() => {
++    let disposed = false
++    let revision = 0
++    const refresh = () => {
++      const request = ++revision
++      void getListMusics(listId).then(list => {
++        if (!disposed && request === revision) setCount(list.length)
++      }).catch(() => {
++        if (!disposed && request === revision) setCount(null)
++      })
++    }
++    const handleUpdate = (ids: string[]) => { if (ids.includes(listId)) refresh() }
++    setCount(null)
++    global.app_event.on('myListMusicUpdate', handleUpdate)
++    refresh()
++    return () => {
++      disposed = true
++      global.app_event.off('myListMusicUpdate', handleUpdate)
++    }
++  }, [listId])
++  return count
++}
+diff --git a/src/theme/material.ts b/src/theme/material.ts
+new file mode 100644
+index 0000000..e432929
+--- /dev/null
++++ b/src/theme/material.ts
+@@ -0,0 +1,42 @@
++// Material 3 roles shared by library, dialogs and playback controls.
++export const materialLight = {
++  primary: '#6750A4',
++  onPrimary: '#FFFFFF',
++  container: '#EADDFF',
++  onContainer: '#21005D',
++  surface: '#FFFBFE',
++  surfaceContainer: '#F3EDF7',
++  onSurface: '#1C1B1F',
++  onSurfaceVariant: '#49454F',
++  outline: '#79747E',
++  outlineVariant: '#CAC4D0',
++}
++
++export const materialDark = {
++  primary: '#D0BCFF',
++  onPrimary: '#381E72',
++  container: '#4F378B',
++  onContainer: '#EADDFF',
++  surface: '#141218',
++  surfaceContainer: '#211F26',
++  onSurface: '#E6E1E5',
++  onSurfaceVariant: '#CAC4D0',
++  outline: '#938F99',
++  outlineVariant: '#49454F',
++}
++
++export const getMaterialColors = (theme: LX.ActiveTheme) => {
++  if (theme.id === 'material' || theme.id === 'material_dark') return theme.isDark ? materialDark : materialLight
++  return {
++    primary: theme['c-primary-font'],
++    onPrimary: theme['c-primary-light-1000'],
++    container: theme['c-button-background'],
++    onContainer: theme['c-button-font'],
++    surface: theme['c-content-background'],
++    surfaceContainer: theme['c-primary-input-background'],
++    onSurface: theme['c-font'],
++    onSurfaceVariant: theme['c-font-label'],
++    outline: theme['c-500'],
++    outlineVariant: theme['c-border-background'],
++  }
++}
+diff --git a/src/theme/themes/createThemes.js b/src/theme/themes/createThemes.js
+index 4ca4f5f..cae538a 100644
+--- a/src/theme/themes/createThemes.js
++++ b/src/theme/themes/createThemes.js
+@@ -5,6 +5,41 @@ const path = require('path')
+ const { createThemeColors } = require('./utils')
+ 
+ const defaultThemes = [
++{
++  "id": "material",
++  "name": "Material 浅色",
++  "isDark": false,
++  "config": {
++    "primary": "rgb(103, 80, 164)",
++    "font": "rgb(28, 27, 31)",
++    "c-app-background": "#FFFBFE",
++    "c-main-background": "#FFFBFE",
++    "bg-image": "",
++    "bg-image-position": "center",
++    "bg-image-size": "cover",
++    "c-badge-primary": "var(c-primary)",
++    "c-badge-secondary": "#7D5260",
++    "c-badge-tertiary": "#625B71"
++  }
++},
++{
++  "id": "material_dark",
++  "name": "Material 深色",
++  "isDark": true,
++  "config": {
++    "primary": "rgb(208, 188, 255)",
++    "font": "rgb(230, 225, 229)",
++    "c-app-background": "#141218",
++    "c-main-background": "#141218",
++    "bg-image": "",
++    "bg-image-position": "center",
++    "bg-image-size": "cover",
++    "c-badge-primary": "var(c-primary)",
++    "c-badge-secondary": "#EFB8C8",
++    "c-badge-tertiary": "#CCC2DC"
++  }
++},
++
+   {
+     id: 'green',
+     name: '绿意盎然',
+diff --git a/src/theme/themes/index.ts b/src/theme/themes/index.ts
+index d53103b..6d49f6b 100644
+--- a/src/theme/themes/index.ts
++++ b/src/theme/themes/index.ts
+@@ -6,6 +6,7 @@ import themeState from '@/store/theme/state'
+ import { isUrl } from '@/utils'
+ import { privateStorageDirectoryPath } from '@/utils/fs'
+ import { type ImageSourcePropType } from 'react-native'
++import { materialLight, materialDark } from '@/theme/material'
+ 
+ export const BG_IMAGES = {
+   'china_ink.jpg': require('./images/china_ink.jpg') as ImageSourcePropType,
+@@ -93,6 +94,22 @@ export const buildActiveThemeColors = (theme: LX.Theme): LX.ActiveTheme => {
+     'c-content-background': theme.config.themeColors['c-primary-light-1000'],
+     'c-border-background': theme.config.themeColors['c-primary-light-100-alpha-700'],
+     'bg-image': bgImg,
++    ...((theme.id === 'material' || theme.id === 'material_dark') ? (() => {
++      const colors = theme.isDark ? materialDark : materialLight
++      return {
++        'c-font': colors.onSurface,
++        'c-font-label': colors.onSurfaceVariant,
++        'c-primary-font': colors.primary,
++        'c-button-font': colors.onContainer,
++        'c-button-font-selected': colors.onContainer,
++        'c-button-background': colors.container,
++        'c-button-background-selected': colors.container,
++        'c-primary-background': colors.surfaceContainer,
++        'c-primary-input-background': colors.surfaceContainer,
++        'c-content-background': colors.surface,
++        'c-border-background': colors.outlineVariant,
++      }
++    })() : {}),
+   } as const
+ }
+ 
+@@ -118,7 +135,7 @@ export const getTheme = async() => {
+   //   // : 'china_ink'
+   //   : settingState.setting['theme.id']
+   let themeId = settingState.setting['common.isAutoTheme'] && shouldUseDarkColors
+-    ? 'black'
++    ? (settingState.setting['theme.id'] === 'material' ? 'material_dark' : 'black')
+     : settingState.setting['theme.id']
+   // themeId = 'naruto'
+   // themeId = 'pink'
+diff --git a/src/theme/themes/themes.ts b/src/theme/themes/themes.ts
+index bb92012..75c814a 100644
+--- a/src/theme/themes/themes.ts
++++ b/src/theme/themes/themes.ts
+@@ -2,6 +2,510 @@
+ //! 此文件由 createThemes.js 生成
+ 
+ export default [
++  {
++    "id": "material",
++    "name": "Material 浅色",
++    "isDark": false,
++    "isCustom": false,
++    "config": {
++      "themeColors": {
++        "c-primary": "rgb(103, 80, 164)",
++        "c-primary-dark-100": "rgb(93,72,148)",
++        "c-primary-dark-100-alpha-100": "rgba(93, 72, 148, 0.90)",
++        "c-primary-alpha-100": "rgba(103, 80, 164, 0.90)",
++        "c-primary-dark-100-alpha-200": "rgba(93, 72, 148, 0.80)",
++        "c-primary-alpha-200": "rgba(103, 80, 164, 0.80)",
++        "c-primary-dark-100-alpha-300": "rgba(93, 72, 148, 0.70)",
++        "c-primary-alpha-300": "rgba(103, 80, 164, 0.70)",
++        "c-primary-dark-100-alpha-400": "rgba(93, 72, 148, 0.60)",
++        "c-primary-alpha-400": "rgba(103, 80, 164, 0.60)",
++        "c-primary-dark-100-alpha-500": "rgba(93, 72, 148, 0.50)",
++        "c-primary-alpha-500": "rgba(103, 80, 164, 0.50)",
++        "c-primary-dark-100-alpha-600": "rgba(93, 72, 148, 0.40)",
++        "c-primary-alpha-600": "rgba(103, 80, 164, 0.40)",
++        "c-primary-dark-100-alpha-700": "rgba(93, 72, 148, 0.30)",
++        "c-primary-alpha-700": "rgba(103, 80, 164, 0.30)",
++        "c-primary-dark-100-alpha-800": "rgba(93, 72, 148, 0.20)",
++        "c-primary-alpha-800": "rgba(103, 80, 164, 0.20)",
++        "c-primary-dark-100-alpha-900": "rgba(93, 72, 148, 0.10)",
++        "c-primary-alpha-900": "rgba(103, 80, 164, 0.10)",
++        "c-primary-dark-200": "rgb(84,65,133)",
++        "c-primary-dark-200-alpha-100": "rgba(84, 65, 133, 0.90)",
++        "c-primary-dark-200-alpha-200": "rgba(84, 65, 133, 0.80)",
++        "c-primary-dark-200-alpha-300": "rgba(84, 65, 133, 0.70)",
++        "c-primary-dark-200-alpha-400": "rgba(84, 65, 133, 0.60)",
++        "c-primary-dark-200-alpha-500": "rgba(84, 65, 133, 0.50)",
++        "c-primary-dark-200-alpha-600": "rgba(84, 65, 133, 0.40)",
++        "c-primary-dark-200-alpha-700": "rgba(84, 65, 133, 0.30)",
++        "c-primary-dark-200-alpha-800": "rgba(84, 65, 133, 0.20)",
++        "c-primary-dark-200-alpha-900": "rgba(84, 65, 133, 0.10)",
++        "c-primary-dark-300": "rgb(76,59,120)",
++        "c-primary-dark-300-alpha-100": "rgba(76, 59, 120, 0.90)",
++        "c-primary-dark-300-alpha-200": "rgba(76, 59, 120, 0.80)",
++        "c-primary-dark-300-alpha-300": "rgba(76, 59, 120, 0.70)",
++        "c-primary-dark-300-alpha-400": "rgba(76, 59, 120, 0.60)",
++        "c-primary-dark-300-alpha-500": "rgba(76, 59, 120, 0.50)",
++        "c-primary-dark-300-alpha-600": "rgba(76, 59, 120, 0.40)",
++        "c-primary-dark-300-alpha-700": "rgba(76, 59, 120, 0.30)",
++        "c-primary-dark-300-alpha-800": "rgba(76, 59, 120, 0.20)",
++        "c-primary-dark-300-alpha-900": "rgba(76, 59, 120, 0.10)",
++        "c-primary-dark-400": "rgb(68,53,108)",
++        "c-primary-dark-400-alpha-100": "rgba(68, 53, 108, 0.90)",
++        "c-primary-dark-400-alpha-200": "rgba(68, 53, 108, 0.80)",
++        "c-primary-dark-400-alpha-300": "rgba(68, 53, 108, 0.70)",
++        "c-primary-dark-400-alpha-400": "rgba(68, 53, 108, 0.60)",
++        "c-primary-dark-400-alpha-500": "rgba(68, 53, 108, 0.50)",
++        "c-primary-dark-400-alpha-600": "rgba(68, 53, 108, 0.40)",
++        "c-primary-dark-400-alpha-700": "rgba(68, 53, 108, 0.30)",
++        "c-primary-dark-400-alpha-800": "rgba(68, 53, 108, 0.20)",
++        "c-primary-dark-400-alpha-900": "rgba(68, 53, 108, 0.10)",
++        "c-primary-dark-500": "rgb(61,48,97)",
++        "c-primary-dark-500-alpha-100": "rgba(61, 48, 97, 0.90)",
++        "c-primary-dark-500-alpha-200": "rgba(61, 48, 97, 0.80)",
++        "c-primary-dark-500-alpha-300": "rgba(61, 48, 97, 0.70)",
++        "c-primary-dark-500-alpha-400": "rgba(61, 48, 97, 0.60)",
++        "c-primary-dark-500-alpha-500": "rgba(61, 48, 97, 0.50)",
++        "c-primary-dark-500-alpha-600": "rgba(61, 48, 97, 0.40)",
++        "c-primary-dark-500-alpha-700": "rgba(61, 48, 97, 0.30)",
++        "c-primary-dark-500-alpha-800": "rgba(61, 48, 97, 0.20)",
++        "c-primary-dark-500-alpha-900": "rgba(61, 48, 97, 0.10)",
++        "c-primary-dark-600": "rgb(55,43,87)",
++        "c-primary-dark-600-alpha-100": "rgba(55, 43, 87, 0.90)",
++        "c-primary-dark-600-alpha-200": "rgba(55, 43, 87, 0.80)",
++        "c-primary-dark-600-alpha-300": "rgba(55, 43, 87, 0.70)",
++        "c-primary-dark-600-alpha-400": "rgba(55, 43, 87, 0.60)",
++        "c-primary-dark-600-alpha-500": "rgba(55, 43, 87, 0.50)",
++        "c-primary-dark-600-alpha-600": "rgba(55, 43, 87, 0.40)",
++        "c-primary-dark-600-alpha-700": "rgba(55, 43, 87, 0.30)",
++        "c-primary-dark-600-alpha-800": "rgba(55, 43, 87, 0.20)",
++        "c-primary-dark-600-alpha-900": "rgba(55, 43, 87, 0.10)",
++        "c-primary-dark-700": "rgb(50,39,78)",
++        "c-primary-dark-700-alpha-100": "rgba(50, 39, 78, 0.90)",
++        "c-primary-dark-700-alpha-200": "rgba(50, 39, 78, 0.80)",
++        "c-primary-dark-700-alpha-300": "rgba(50, 39, 78, 0.70)",
++        "c-primary-dark-700-alpha-400": "rgba(50, 39, 78, 0.60)",
++        "c-primary-dark-700-alpha-500": "rgba(50, 39, 78, 0.50)",
++        "c-primary-dark-700-alpha-600": "rgba(50, 39, 78, 0.40)",
++        "c-primary-dark-700-alpha-700": "rgba(50, 39, 78, 0.30)",
++        "c-primary-dark-700-alpha-800": "rgba(50, 39, 78, 0.20)",
++        "c-primary-dark-700-alpha-900": "rgba(50, 39, 78, 0.10)",
++        "c-primary-dark-800": "rgb(45,35,70)",
++        "c-primary-dark-800-alpha-100": "rgba(45, 35, 70, 0.90)",
++        "c-primary-dark-800-alpha-200": "rgba(45, 35, 70, 0.80)",
++        "c-primary-dark-800-alpha-300": "rgba(45, 35, 70, 0.70)",
++        "c-primary-dark-800-alpha-400": "rgba(45, 35, 70, 0.60)",
++        "c-primary-dark-800-alpha-500": "rgba(45, 35, 70, 0.50)",
++        "c-primary-dark-800-alpha-600": "rgba(45, 35, 70, 0.40)",
++        "c-primary-dark-800-alpha-700": "rgba(45, 35, 70, 0.30)",
++        "c-primary-dark-800-alpha-800": "rgba(45, 35, 70, 0.20)",
++        "c-primary-dark-800-alpha-900": "rgba(45, 35, 70, 0.10)",
++        "c-primary-dark-900": "rgb(41,32,63)",
++        "c-primary-dark-900-alpha-100": "rgba(41, 32, 63, 0.90)",
++        "c-primary-dark-900-alpha-200": "rgba(41, 32, 63, 0.80)",
++        "c-primary-dark-900-alpha-300": "rgba(41, 32, 63, 0.70)",
++        "c-primary-dark-900-alpha-400": "rgba(41, 32, 63, 0.60)",
++        "c-primary-dark-900-alpha-500": "rgba(41, 32, 63, 0.50)",
++        "c-primary-dark-900-alpha-600": "rgba(41, 32, 63, 0.40)",
++        "c-primary-dark-900-alpha-700": "rgba(41, 32, 63, 0.30)",
++        "c-primary-dark-900-alpha-800": "rgba(41, 32, 63, 0.20)",
++        "c-primary-dark-900-alpha-900": "rgba(41, 32, 63, 0.10)",
++        "c-primary-dark-1000": "rgb(37,29,57)",
++        "c-primary-dark-1000-alpha-100": "rgba(37, 29, 57, 0.90)",
++        "c-primary-dark-1000-alpha-200": "rgba(37, 29, 57, 0.80)",
++        "c-primary-dark-1000-alpha-300": "rgba(37, 29, 57, 0.70)",
++        "c-primary-dark-1000-alpha-400": "rgba(37, 29, 57, 0.60)",
++        "c-primary-dark-1000-alpha-500": "rgba(37, 29, 57, 0.50)",
++        "c-primary-dark-1000-alpha-600": "rgba(37, 29, 57, 0.40)",
++        "c-primary-dark-1000-alpha-700": "rgba(37, 29, 57, 0.30)",
++        "c-primary-dark-1000-alpha-800": "rgba(37, 29, 57, 0.20)",
++        "c-primary-dark-1000-alpha-900": "rgba(37, 29, 57, 0.10)",
++        "c-primary-light-100": "rgb(133,115,182)",
++        "c-primary-light-100-alpha-100": "rgba(133, 115, 182, 0.90)",
++        "c-primary-light-100-alpha-200": "rgba(133, 115, 182, 0.80)",
++        "c-primary-light-100-alpha-300": "rgba(133, 115, 182, 0.70)",
++        "c-primary-light-100-alpha-400": "rgba(133, 115, 182, 0.60)",
++        "c-primary-light-100-alpha-500": "rgba(133, 115, 182, 0.50)",
++        "c-primary-light-100-alpha-600": "rgba(133, 115, 182, 0.40)",
++        "c-primary-light-100-alpha-700": "rgba(133, 115, 182, 0.30)",
++        "c-primary-light-100-alpha-800": "rgba(133, 115, 182, 0.20)",
++        "c-primary-light-100-alpha-900": "rgba(133, 115, 182, 0.10)",
++        "c-primary-light-200": "rgb(157,143,197)",
++        "c-primary-light-200-alpha-100": "rgba(157, 143, 197, 0.90)",
++        "c-primary-light-200-alpha-200": "rgba(157, 143, 197, 0.80)",
++        "c-primary-light-200-alpha-300": "rgba(157, 143, 197, 0.70)",
++        "c-primary-light-200-alpha-400": "rgba(157, 143, 197, 0.60)",
++        "c-primary-light-200-alpha-500": "rgba(157, 143, 197, 0.50)",
++        "c-primary-light-200-alpha-600": "rgba(157, 143, 197, 0.40)",
++        "c-primary-light-200-alpha-700": "rgba(157, 143, 197, 0.30)",
++        "c-primary-light-200-alpha-800": "rgba(157, 143, 197, 0.20)",
++        "c-primary-light-200-alpha-900": "rgba(157, 143, 197, 0.10)",
++        "c-primary-light-300": "rgb(177,165,209)",
++        "c-primary-light-300-alpha-100": "rgba(177, 165, 209, 0.90)",
++        "c-primary-light-300-alpha-200": "rgba(177, 165, 209, 0.80)",
++        "c-primary-light-300-alpha-300": "rgba(177, 165, 209, 0.70)",
++        "c-primary-light-300-alpha-400": "rgba(177, 165, 209, 0.60)",
++        "c-primary-light-300-alpha-500": "rgba(177, 165, 209, 0.50)",
++        "c-primary-light-300-alpha-600": "rgba(177, 165, 209, 0.40)",
++        "c-primary-light-300-alpha-700": "rgba(177, 165, 209, 0.30)",
++        "c-primary-light-300-alpha-800": "rgba(177, 165, 209, 0.20)",
++        "c-primary-light-300-alpha-900": "rgba(177, 165, 209, 0.10)",
++        "c-primary-light-400": "rgb(193,183,218)",
++        "c-primary-light-400-alpha-100": "rgba(193, 183, 218, 0.90)",
++        "c-primary-light-400-alpha-200": "rgba(193, 183, 218, 0.80)",
++        "c-primary-light-400-alpha-300": "rgba(193, 183, 218, 0.70)",
++        "c-primary-light-400-alpha-400": "rgba(193, 183, 218, 0.60)",
++        "c-primary-light-400-alpha-500": "rgba(193, 183, 218, 0.50)",
++        "c-primary-light-400-alpha-600": "rgba(193, 183, 218, 0.40)",
++        "c-primary-light-400-alpha-700": "rgba(193, 183, 218, 0.30)",
++        "c-primary-light-400-alpha-800": "rgba(193, 183, 218, 0.20)",
++        "c-primary-light-400-alpha-900": "rgba(193, 183, 218, 0.10)",
++        "c-primary-light-500": "rgb(205,197,225)",
++        "c-primary-light-500-alpha-100": "rgba(205, 197, 225, 0.90)",
++        "c-primary-light-500-alpha-200": "rgba(205, 197, 225, 0.80)",
++        "c-primary-light-500-alpha-300": "rgba(205, 197, 225, 0.70)",
++        "c-primary-light-500-alpha-400": "rgba(205, 197, 225, 0.60)",
++        "c-primary-light-500-alpha-500": "rgba(205, 197, 225, 0.50)",
++        "c-primary-light-500-alpha-600": "rgba(205, 197, 225, 0.40)",
++        "c-primary-light-500-alpha-700": "rgba(205, 197, 225, 0.30)",
++        "c-primary-light-500-alpha-800": "rgba(205, 197, 225, 0.20)",
++        "c-primary-light-500-alpha-900": "rgba(205, 197, 225, 0.10)",
++        "c-primary-light-600": "rgb(215,209,231)",
++        "c-primary-light-600-alpha-100": "rgba(215, 209, 231, 0.90)",
++        "c-primary-light-600-alpha-200": "rgba(215, 209, 231, 0.80)",
++        "c-primary-light-600-alpha-300": "rgba(215, 209, 231, 0.70)",
++        "c-primary-light-600-alpha-400": "rgba(215, 209, 231, 0.60)",
++        "c-primary-light-600-alpha-500": "rgba(215, 209, 231, 0.50)",
++        "c-primary-light-600-alpha-600": "rgba(215, 209, 231, 0.40)",
++        "c-primary-light-600-alpha-700": "rgba(215, 209, 231, 0.30)",
++        "c-primary-light-600-alpha-800": "rgba(215, 209, 231, 0.20)",
++        "c-primary-light-600-alpha-900": "rgba(215, 209, 231, 0.10)",
++        "c-primary-light-700": "rgb(223,218,236)",
++        "c-primary-light-700-alpha-100": "rgba(223, 218, 236, 0.90)",
++        "c-primary-light-700-alpha-200": "rgba(223, 218, 236, 0.80)",
++        "c-primary-light-700-alpha-300": "rgba(223, 218, 236, 0.70)",
++        "c-primary-light-700-alpha-400": "rgba(223, 218, 236, 0.60)",
++        "c-primary-light-700-alpha-500": "rgba(223, 218, 236, 0.50)",
++        "c-primary-light-700-alpha-600": "rgba(223, 218, 236, 0.40)",
++        "c-primary-light-700-alpha-700": "rgba(223, 218, 236, 0.30)",
++        "c-primary-light-700-alpha-800": "rgba(223, 218, 236, 0.20)",
++        "c-primary-light-700-alpha-900": "rgba(223, 218, 236, 0.10)",
++        "c-primary-light-800": "rgb(229,225,240)",
++        "c-primary-light-800-alpha-100": "rgba(229, 225, 240, 0.90)",
++        "c-primary-light-800-alpha-200": "rgba(229, 225, 240, 0.80)",
++        "c-primary-light-800-alpha-300": "rgba(229, 225, 240, 0.70)",
++        "c-primary-light-800-alpha-400": "rgba(229, 225, 240, 0.60)",
++        "c-primary-light-800-alpha-500": "rgba(229, 225, 240, 0.50)",
++        "c-primary-light-800-alpha-600": "rgba(229, 225, 240, 0.40)",
++        "c-primary-light-800-alpha-700": "rgba(229, 225, 240, 0.30)",
++        "c-primary-light-800-alpha-800": "rgba(229, 225, 240, 0.20)",
++        "c-primary-light-800-alpha-900": "rgba(229, 225, 240, 0.10)",
++        "c-primary-light-900": "rgb(234,231,243)",
++        "c-primary-light-900-alpha-100": "rgba(234, 231, 243, 0.90)",
++        "c-primary-light-900-alpha-200": "rgba(234, 231, 243, 0.80)",
++        "c-primary-light-900-alpha-300": "rgba(234, 231, 243, 0.70)",
++        "c-primary-light-900-alpha-400": "rgba(234, 231, 243, 0.60)",
++        "c-primary-light-900-alpha-500": "rgba(234, 231, 243, 0.50)",
++        "c-primary-light-900-alpha-600": "rgba(234, 231, 243, 0.40)",
++        "c-primary-light-900-alpha-700": "rgba(234, 231, 243, 0.30)",
++        "c-primary-light-900-alpha-800": "rgba(234, 231, 243, 0.20)",
++        "c-primary-light-900-alpha-900": "rgba(234, 231, 243, 0.10)",
++        "c-primary-light-1000": "rgb(255,255,255)",
++        "c-primary-light-1000-alpha-100": "rgba(255, 255, 255, 0.90)",
++        "c-primary-light-1000-alpha-200": "rgba(255, 255, 255, 0.80)",
++        "c-primary-light-1000-alpha-300": "rgba(255, 255, 255, 0.70)",
++        "c-primary-light-1000-alpha-400": "rgba(255, 255, 255, 0.60)",
++        "c-primary-light-1000-alpha-500": "rgba(255, 255, 255, 0.50)",
++        "c-primary-light-1000-alpha-600": "rgba(255, 255, 255, 0.40)",
++        "c-primary-light-1000-alpha-700": "rgba(255, 255, 255, 0.30)",
++        "c-primary-light-1000-alpha-800": "rgba(255, 255, 255, 0.20)",
++        "c-primary-light-1000-alpha-900": "rgba(255, 255, 255, 0.10)",
++        "c-theme": "rgb(103, 80, 164)",
++        "c-1000": "rgb(28, 27, 31)",
++        "c-950": "rgb(39,38,42)",
++        "c-900": "rgb(51,50,53)",
++        "c-850": "rgb(62,61,65)",
++        "c-800": "rgb(73,73,76)",
++        "c-750": "rgb(85,84,87)",
++        "c-700": "rgb(96,95,98)",
++        "c-650": "rgb(107,107,109)",
++        "c-600": "rgb(119,118,121)",
++        "c-550": "rgb(130,130,132)",
++        "c-500": "rgb(142,141,143)",
++        "c-450": "rgb(153,152,154)",
++        "c-400": "rgb(164,164,165)",
++        "c-350": "rgb(176,175,177)",
++        "c-300": "rgb(187,187,188)",
++        "c-250": "rgb(198,198,199)",
++        "c-200": "rgb(210,209,210)",
++        "c-150": "rgb(221,221,221)",
++        "c-100": "rgb(232,232,233)",
++        "c-050": "rgb(244,244,244)",
++        "c-000": "rgb(255,255,255)"
++      },
++      "extInfo": {
++        "c-app-background": "#FFFBFE",
++        "c-main-background": "#FFFBFE",
++        "bg-image": "",
++        "bg-image-position": "center",
++        "bg-image-size": "cover",
++        "c-badge-primary": "var(c-primary)",
++        "c-badge-secondary": "#7D5260",
++        "c-badge-tertiary": "#625B71"
++      }
++    }
++  },
++  {
++    "id": "material_dark",
++    "name": "Material 深色",
++    "isDark": true,
++    "isCustom": false,
++    "config": {
++      "themeColors": {
++        "c-primary": "rgb(208, 188, 255)",
++        "c-primary-dark-100": "rgb(217,201,255)",
++        "c-primary-dark-100-alpha-100": "rgba(217, 201, 255, 0.90)",
++        "c-primary-alpha-100": "rgba(208, 188, 255, 0.90)",
++        "c-primary-dark-100-alpha-200": "rgba(217, 201, 255, 0.80)",
++        "c-primary-alpha-200": "rgba(208, 188, 255, 0.80)",
++        "c-primary-dark-100-alpha-300": "rgba(217, 201, 255, 0.70)",
++        "c-primary-alpha-300": "rgba(208, 188, 255, 0.70)",
++        "c-primary-dark-100-alpha-400": "rgba(217, 201, 255, 0.60)",
++        "c-primary-alpha-400": "rgba(208, 188, 255, 0.60)",
++        "c-primary-dark-100-alpha-500": "rgba(217, 201, 255, 0.50)",
++        "c-primary-alpha-500": "rgba(208, 188, 255, 0.50)",
++        "c-primary-dark-100-alpha-600": "rgba(217, 201, 255, 0.40)",
++        "c-primary-alpha-600": "rgba(208, 188, 255, 0.40)",
++        "c-primary-dark-100-alpha-700": "rgba(217, 201, 255, 0.30)",
++        "c-primary-alpha-700": "rgba(208, 188, 255, 0.30)",
++        "c-primary-dark-100-alpha-800": "rgba(217, 201, 255, 0.20)",
++        "c-primary-alpha-800": "rgba(208, 188, 255, 0.20)",
++        "c-primary-dark-100-alpha-900": "rgba(217, 201, 255, 0.10)",
++        "c-primary-alpha-900": "rgba(208, 188, 255, 0.10)",
++        "c-primary-dark-200": "rgb(225,212,255)",
++        "c-primary-dark-200-alpha-100": "rgba(225, 212, 255, 0.90)",
++        "c-primary-dark-200-alpha-200": "rgba(225, 212, 255, 0.80)",
++        "c-primary-dark-200-alpha-300": "rgba(225, 212, 255, 0.70)",
++        "c-primary-dark-200-alpha-400": "rgba(225, 212, 255, 0.60)",
++        "c-primary-dark-200-alpha-500": "rgba(225, 212, 255, 0.50)",
++        "c-primary-dark-200-alpha-600": "rgba(225, 212, 255, 0.40)",
++        "c-primary-dark-200-alpha-700": "rgba(225, 212, 255, 0.30)",
++        "c-primary-dark-200-alpha-800": "rgba(225, 212, 255, 0.20)",
++        "c-primary-dark-200-alpha-900": "rgba(225, 212, 255, 0.10)",
++        "c-primary-dark-300": "rgb(231,221,255)",
++        "c-primary-dark-300-alpha-100": "rgba(231, 221, 255, 0.90)",
++        "c-primary-dark-300-alpha-200": "rgba(231, 221, 255, 0.80)",
++        "c-primary-dark-300-alpha-300": "rgba(231, 221, 255, 0.70)",
++        "c-primary-dark-300-alpha-400": "rgba(231, 221, 255, 0.60)",
++        "c-primary-dark-300-alpha-500": "rgba(231, 221, 255, 0.50)",
++        "c-primary-dark-300-alpha-600": "rgba(231, 221, 255, 0.40)",
++        "c-primary-dark-300-alpha-700": "rgba(231, 221, 255, 0.30)",
++        "c-primary-dark-300-alpha-800": "rgba(231, 221, 255, 0.20)",
++        "c-primary-dark-300-alpha-900": "rgba(231, 221, 255, 0.10)",
++        "c-primary-dark-400": "rgb(236,228,255)",
++        "c-primary-dark-400-alpha-100": "rgba(236, 228, 255, 0.90)",
++        "c-primary-dark-400-alpha-200": "rgba(236, 228, 255, 0.80)",
++        "c-primary-dark-400-alpha-300": "rgba(236, 228, 255, 0.70)",
++        "c-primary-dark-400-alpha-400": "rgba(236, 228, 255, 0.60)",
++        "c-primary-dark-400-alpha-500": "rgba(236, 228, 255, 0.50)",
++        "c-primary-dark-400-alpha-600": "rgba(236, 228, 255, 0.40)",
++        "c-primary-dark-400-alpha-700": "rgba(236, 228, 255, 0.30)",
++        "c-primary-dark-400-alpha-800": "rgba(236, 228, 255, 0.20)",
++        "c-primary-dark-400-alpha-900": "rgba(236, 228, 255, 0.10)",
++        "c-primary-dark-500": "rgb(240,233,255)",
++        "c-primary-dark-500-alpha-100": "rgba(240, 233, 255, 0.90)",
++        "c-primary-dark-500-alpha-200": "rgba(240, 233, 255, 0.80)",
++        "c-primary-dark-500-alpha-300": "rgba(240, 233, 255, 0.70)",
++        "c-primary-dark-500-alpha-400": "rgba(240, 233, 255, 0.60)",
++        "c-primary-dark-500-alpha-500": "rgba(240, 233, 255, 0.50)",
++        "c-primary-dark-500-alpha-600": "rgba(240, 233, 255, 0.40)",
++        "c-primary-dark-500-alpha-700": "rgba(240, 233, 255, 0.30)",
++        "c-primary-dark-500-alpha-800": "rgba(240, 233, 255, 0.20)",
++        "c-primary-dark-500-alpha-900": "rgba(240, 233, 255, 0.10)",
++        "c-primary-dark-600": "rgb(243,237,255)",
++        "c-primary-dark-600-alpha-100": "rgba(243, 237, 255, 0.90)",
++        "c-primary-dark-600-alpha-200": "rgba(243, 237, 255, 0.80)",
++        "c-primary-dark-600-alpha-300": "rgba(243, 237, 255, 0.70)",
++        "c-primary-dark-600-alpha-400": "rgba(243, 237, 255, 0.60)",
++        "c-primary-dark-600-alpha-500": "rgba(243, 237, 255, 0.50)",
++        "c-primary-dark-600-alpha-600": "rgba(243, 237, 255, 0.40)",
++        "c-primary-dark-600-alpha-700": "rgba(243, 237, 255, 0.30)",
++        "c-primary-dark-600-alpha-800": "rgba(243, 237, 255, 0.20)",
++        "c-primary-dark-600-alpha-900": "rgba(243, 237, 255, 0.10)",
++        "c-primary-dark-700": "rgb(245,241,255)",
++        "c-primary-dark-700-alpha-100": "rgba(245, 241, 255, 0.90)",
++        "c-primary-dark-700-alpha-200": "rgba(245, 241, 255, 0.80)",
++        "c-primary-dark-700-alpha-300": "rgba(245, 241, 255, 0.70)",
++        "c-primary-dark-700-alpha-400": "rgba(245, 241, 255, 0.60)",
++        "c-primary-dark-700-alpha-500": "rgba(245, 241, 255, 0.50)",
++        "c-primary-dark-700-alpha-600": "rgba(245, 241, 255, 0.40)",
++        "c-primary-dark-700-alpha-700": "rgba(245, 241, 255, 0.30)",
++        "c-primary-dark-700-alpha-800": "rgba(245, 241, 255, 0.20)",
++        "c-primary-dark-700-alpha-900": "rgba(245, 241, 255, 0.10)",
++        "c-primary-dark-800": "rgb(247,244,255)",
++        "c-primary-dark-800-alpha-100": "rgba(247, 244, 255, 0.90)",
++        "c-primary-dark-800-alpha-200": "rgba(247, 244, 255, 0.80)",
++        "c-primary-dark-800-alpha-300": "rgba(247, 244, 255, 0.70)",
++        "c-primary-dark-800-alpha-400": "rgba(247, 244, 255, 0.60)",
++        "c-primary-dark-800-alpha-500": "rgba(247, 244, 255, 0.50)",
++        "c-primary-dark-800-alpha-600": "rgba(247, 244, 255, 0.40)",
++        "c-primary-dark-800-alpha-700": "rgba(247, 244, 255, 0.30)",
++        "c-primary-dark-800-alpha-800": "rgba(247, 244, 255, 0.20)",
++        "c-primary-dark-800-alpha-900": "rgba(247, 244, 255, 0.10)",
++        "c-primary-dark-900": "rgb(249,246,255)",
++        "c-primary-dark-900-alpha-100": "rgba(249, 246, 255, 0.90)",
++        "c-primary-dark-900-alpha-200": "rgba(249, 246, 255, 0.80)",
++        "c-primary-dark-900-alpha-300": "rgba(249, 246, 255, 0.70)",
++        "c-primary-dark-900-alpha-400": "rgba(249, 246, 255, 0.60)",
++        "c-primary-dark-900-alpha-500": "rgba(249, 246, 255, 0.50)",
++        "c-primary-dark-900-alpha-600": "rgba(249, 246, 255, 0.40)",
++        "c-primary-dark-900-alpha-700": "rgba(249, 246, 255, 0.30)",
++        "c-primary-dark-900-alpha-800": "rgba(249, 246, 255, 0.20)",
++        "c-primary-dark-900-alpha-900": "rgba(249, 246, 255, 0.10)",
++        "c-primary-dark-1000": "rgb(250,248,255)",
++        "c-primary-dark-1000-alpha-100": "rgba(250, 248, 255, 0.90)",
++        "c-primary-dark-1000-alpha-200": "rgba(250, 248, 255, 0.80)",
++        "c-primary-dark-1000-alpha-300": "rgba(250, 248, 255, 0.70)",
++        "c-primary-dark-1000-alpha-400": "rgba(250, 248, 255, 0.60)",
++        "c-primary-dark-1000-alpha-500": "rgba(250, 248, 255, 0.50)",
++        "c-primary-dark-1000-alpha-600": "rgba(250, 248, 255, 0.40)",
++        "c-primary-dark-1000-alpha-700": "rgba(250, 248, 255, 0.30)",
++        "c-primary-dark-1000-alpha-800": "rgba(250, 248, 255, 0.20)",
++        "c-primary-dark-1000-alpha-900": "rgba(250, 248, 255, 0.10)",
++        "c-primary-light-100": "rgb(187,169,230)",
++        "c-primary-light-100-alpha-100": "rgba(187, 169, 230, 0.90)",
++        "c-primary-light-100-alpha-200": "rgba(187, 169, 230, 0.80)",
++        "c-primary-light-100-alpha-300": "rgba(187, 169, 230, 0.70)",
++        "c-primary-light-100-alpha-400": "rgba(187, 169, 230, 0.60)",
++        "c-primary-light-100-alpha-500": "rgba(187, 169, 230, 0.50)",
++        "c-primary-light-100-alpha-600": "rgba(187, 169, 230, 0.40)",
++        "c-primary-light-100-alpha-700": "rgba(187, 169, 230, 0.30)",
++        "c-primary-light-100-alpha-800": "rgba(187, 169, 230, 0.20)",
++        "c-primary-light-100-alpha-900": "rgba(187, 169, 230, 0.10)",
++        "c-primary-light-200": "rgb(168,152,207)",
++        "c-primary-light-200-alpha-100": "rgba(168, 152, 207, 0.90)",
++        "c-primary-light-200-alpha-200": "rgba(168, 152, 207, 0.80)",
++        "c-primary-light-200-alpha-300": "rgba(168, 152, 207, 0.70)",
++        "c-primary-light-200-alpha-400": "rgba(168, 152, 207, 0.60)",
++        "c-primary-light-200-alpha-500": "rgba(168, 152, 207, 0.50)",
++        "c-primary-light-200-alpha-600": "rgba(168, 152, 207, 0.40)",
++        "c-primary-light-200-alpha-700": "rgba(168, 152, 207, 0.30)",
++        "c-primary-light-200-alpha-800": "rgba(168, 152, 207, 0.20)",
++        "c-primary-light-200-alpha-900": "rgba(168, 152, 207, 0.10)",
++        "c-primary-light-300": "rgb(151,137,186)",
++        "c-primary-light-300-alpha-100": "rgba(151, 137, 186, 0.90)",
++        "c-primary-light-300-alpha-200": "rgba(151, 137, 186, 0.80)",
++        "c-primary-light-300-alpha-300": "rgba(151, 137, 186, 0.70)",
++        "c-primary-light-300-alpha-400": "rgba(151, 137, 186, 0.60)",
++        "c-primary-light-300-alpha-500": "rgba(151, 137, 186, 0.50)",
++        "c-primary-light-300-alpha-600": "rgba(151, 137, 186, 0.40)",
++        "c-primary-light-300-alpha-700": "rgba(151, 137, 186, 0.30)",
++        "c-primary-light-300-alpha-800": "rgba(151, 137, 186, 0.20)",
++        "c-primary-light-300-alpha-900": "rgba(151, 137, 186, 0.10)",
++        "c-primary-light-400": "rgb(136,123,167)",
++        "c-primary-light-400-alpha-100": "rgba(136, 123, 167, 0.90)",
++        "c-primary-light-400-alpha-200": "rgba(136, 123, 167, 0.80)",
++        "c-primary-light-400-alpha-300": "rgba(136, 123, 167, 0.70)",
++        "c-primary-light-400-alpha-400": "rgba(136, 123, 167, 0.60)",
++        "c-primary-light-400-alpha-500": "rgba(136, 123, 167, 0.50)",
++        "c-primary-light-400-alpha-600": "rgba(136, 123, 167, 0.40)",
++        "c-primary-light-400-alpha-700": "rgba(136, 123, 167, 0.30)",
++        "c-primary-light-400-alpha-800": "rgba(136, 123, 167, 0.20)",
++        "c-primary-light-400-alpha-900": "rgba(136, 123, 167, 0.10)",
++        "c-primary-light-500": "rgb(122,111,150)",
++        "c-primary-light-500-alpha-100": "rgba(122, 111, 150, 0.90)",
++        "c-primary-light-500-alpha-200": "rgba(122, 111, 150, 0.80)",
++        "c-primary-light-500-alpha-300": "rgba(122, 111, 150, 0.70)",
++        "c-primary-light-500-alpha-400": "rgba(122, 111, 150, 0.60)",
++        "c-primary-light-500-alpha-500": "rgba(122, 111, 150, 0.50)",
++        "c-primary-light-500-alpha-600": "rgba(122, 111, 150, 0.40)",
++        "c-primary-light-500-alpha-700": "rgba(122, 111, 150, 0.30)",
++        "c-primary-light-500-alpha-800": "rgba(122, 111, 150, 0.20)",
++        "c-primary-light-500-alpha-900": "rgba(122, 111, 150, 0.10)",
++        "c-primary-light-600": "rgb(110,100,135)",
++        "c-primary-light-600-alpha-100": "rgba(110, 100, 135, 0.90)",
++        "c-primary-light-600-alpha-200": "rgba(110, 100, 135, 0.80)",
++        "c-primary-light-600-alpha-300": "rgba(110, 100, 135, 0.70)",
++        "c-primary-light-600-alpha-400": "rgba(110, 100, 135, 0.60)",
++        "c-primary-light-600-alpha-500": "rgba(110, 100, 135, 0.50)",
++        "c-primary-light-600-alpha-600": "rgba(110, 100, 135, 0.40)",
++        "c-primary-light-600-alpha-700": "rgba(110, 100, 135, 0.30)",
++        "c-primary-light-600-alpha-800": "rgba(110, 100, 135, 0.20)",
++        "c-primary-light-600-alpha-900": "rgba(110, 100, 135, 0.10)",
++        "c-primary-light-700": "rgb(99,90,122)",
++        "c-primary-light-700-alpha-100": "rgba(99, 90, 122, 0.90)",
++        "c-primary-light-700-alpha-200": "rgba(99, 90, 122, 0.80)",
++        "c-primary-light-700-alpha-300": "rgba(99, 90, 122, 0.70)",
++        "c-primary-light-700-alpha-400": "rgba(99, 90, 122, 0.60)",
++        "c-primary-light-700-alpha-500": "rgba(99, 90, 122, 0.50)",
++        "c-primary-light-700-alpha-600": "rgba(99, 90, 122, 0.40)",
++        "c-primary-light-700-alpha-700": "rgba(99, 90, 122, 0.30)",
++        "c-primary-light-700-alpha-800": "rgba(99, 90, 122, 0.20)",
++        "c-primary-light-700-alpha-900": "rgba(99, 90, 122, 0.10)",
++        "c-primary-light-800": "rgb(89,81,110)",
++        "c-primary-light-800-alpha-100": "rgba(89, 81, 110, 0.90)",
++        "c-primary-light-800-alpha-200": "rgba(89, 81, 110, 0.80)",
++        "c-primary-light-800-alpha-300": "rgba(89, 81, 110, 0.70)",
++        "c-primary-light-800-alpha-400": "rgba(89, 81, 110, 0.60)",
++        "c-primary-light-800-alpha-500": "rgba(89, 81, 110, 0.50)",
++        "c-primary-light-800-alpha-600": "rgba(89, 81, 110, 0.40)",
++        "c-primary-light-800-alpha-700": "rgba(89, 81, 110, 0.30)",
++        "c-primary-light-800-alpha-800": "rgba(89, 81, 110, 0.20)",
++        "c-primary-light-800-alpha-900": "rgba(89, 81, 110, 0.10)",
++        "c-primary-light-900": "rgb(80,73,99)",
++        "c-primary-light-900-alpha-100": "rgba(80, 73, 99, 0.90)",
++        "c-primary-light-900-alpha-200": "rgba(80, 73, 99, 0.80)",
++        "c-primary-light-900-alpha-300": "rgba(80, 73, 99, 0.70)",
++        "c-primary-light-900-alpha-400": "rgba(80, 73, 99, 0.60)",
++        "c-primary-light-900-alpha-500": "rgba(80, 73, 99, 0.50)",
++        "c-primary-light-900-alpha-600": "rgba(80, 73, 99, 0.40)",
++        "c-primary-light-900-alpha-700": "rgba(80, 73, 99, 0.30)",
++        "c-primary-light-900-alpha-800": "rgba(80, 73, 99, 0.20)",
++        "c-primary-light-900-alpha-900": "rgba(80, 73, 99, 0.10)",
++        "c-primary-light-1000": "rgb(52,47,64)",
++        "c-primary-light-1000-alpha-100": "rgba(52, 47, 64, 0.90)",
++        "c-primary-light-1000-alpha-200": "rgba(52, 47, 64, 0.80)",
++        "c-primary-light-1000-alpha-300": "rgba(52, 47, 64, 0.70)",
++        "c-primary-light-1000-alpha-400": "rgba(52, 47, 64, 0.60)",
++        "c-primary-light-1000-alpha-500": "rgba(52, 47, 64, 0.50)",
++        "c-primary-light-1000-alpha-600": "rgba(52, 47, 64, 0.40)",
++        "c-primary-light-1000-alpha-700": "rgba(52, 47, 64, 0.30)",
++        "c-primary-light-1000-alpha-800": "rgba(52, 47, 64, 0.20)",
++        "c-primary-light-1000-alpha-900": "rgba(52, 47, 64, 0.10)",
++        "c-theme": "rgb(80,73,99)",
++        "c-1000": "rgb(230, 225, 229)",
++        "c-950": "rgb(219,214,218)",
++        "c-900": "rgb(208,203,207)",
++        "c-850": "rgb(198,193,197)",
++        "c-800": "rgb(188,183,187)",
++        "c-750": "rgb(179,174,178)",
++        "c-700": "rgb(170,165,169)",
++        "c-650": "rgb(162,157,161)",
++        "c-600": "rgb(154,149,153)",
++        "c-550": "rgb(146,142,145)",
++        "c-500": "rgb(139,135,138)",
++        "c-450": "rgb(132,128,131)",
++        "c-400": "rgb(125,122,124)",
++        "c-350": "rgb(119,116,118)",
++        "c-300": "rgb(113,110,112)",
++        "c-250": "rgb(107,105,106)",
++        "c-200": "rgb(102,100,101)",
++        "c-150": "rgb(97,95,96)",
++        "c-100": "rgb(92,90,91)",
++        "c-050": "rgb(87,86,86)",
++        "c-000": "rgb(83,82,82)"
++      },
++      "extInfo": {
++        "c-app-background": "#141218",
++        "c-main-background": "#141218",
++        "bg-image": "",
++        "bg-image-position": "center",
++        "bg-image-size": "cover",
++        "c-badge-primary": "var(c-primary)",
++        "c-badge-secondary": "#EFB8C8",
++        "c-badge-tertiary": "#CCC2DC"
++      }
++    }
++  },
+   {
+     "id": "green",
+     "name": "绿意盎然",
+diff --git a/src/utils/playlist.ts b/src/utils/playlist.ts
+new file mode 100644
+index 0000000..67fb0bc
+--- /dev/null
++++ b/src/utils/playlist.ts
+@@ -0,0 +1,8 @@
++import { LIST_IDS } from '@/config/constant'
++
++// Keep original indices available to menus; filtering never reorders stored lists.
++export const filterPlaylists = (lists: LX.List.MyListInfo[], keyword: string, excludeId?: string) => {
++  const query = keyword.trim().toLocaleLowerCase()
++  const matches = lists.filter(list => list.id !== excludeId && list.name.toLocaleLowerCase().includes(query))
++  return [...matches.filter(list => list.id === LIST_IDS.LOVE), ...matches.filter(list => list.id !== LIST_IDS.LOVE)]
++}
