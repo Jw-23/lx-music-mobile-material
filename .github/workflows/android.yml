@@ -1,0 +1,124 @@
+name: Build Material APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/android.yml'
+      - 'patches/**'
+      - 'scripts/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: material-apk-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      DISABLE_SVG: '1'
+    steps:
+      - name: Check out build configuration
+        uses: actions/checkout@v4
+        with:
+          path: build-config
+          persist-credentials: false
+
+      - name: Check out complete official LX Music source
+        uses: actions/checkout@v4
+        with:
+          repository: lyswhut/lx-music-mobile
+          ref: fb8480728d875fa5e0da25eebd3a26bb71723aae
+          path: source
+          persist-credentials: false
+
+      - name: Apply Material redesign
+        working-directory: source
+        run: |
+          git apply --check ../build-config/patches/lx-material.patch
+          git apply ../build-config/patches/lx-material.patch
+          python3 ../build-config/scripts/configure-build.py .
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: source/package-lock.json
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build packages
+        run: sdkmanager 'platforms;android-36' 'build-tools;35.0.0' 'ndk;26.1.10909125'
+
+      - name: Install JavaScript dependencies
+        working-directory: source
+        run: |
+          git config --global url."https://github.com/".insteadOf 'ssh://git@github.com/'
+          git config --global --add url."https://github.com/".insteadOf 'git@github.com:'
+          npm ci --no-audit --no-fund
+
+      - name: Validate library behavior and generate themes
+        working-directory: source
+        run: |
+          npm run test:library
+          npm run build:theme
+          git diff --check
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build standalone signed APKs
+        working-directory: source/android
+        run: |
+          chmod +x gradlew
+          test -f app/debug.keystore
+          ./gradlew assembleRelease --no-daemon --max-workers=2 \
+            -PreactNativeArchitectures=arm64-v8a,armeabi-v7a \
+            -PMYAPP_UPLOAD_STORE_FILE=debug.keystore \
+            -PMYAPP_UPLOAD_KEY_ALIAS=androiddebugkey \
+            -PMYAPP_UPLOAD_STORE_PASSWORD=android \
+            -PMYAPP_UPLOAD_KEY_PASSWORD=android
+
+      - name: Verify APK signatures and produce checksums
+        run: |
+          mkdir -p output
+          cp source/android/app/build/outputs/apk/release/*.apk output/
+          for apk in output/*.apk; do
+            "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify "$apk"
+          done
+          cd output
+          sha256sum *.apk > SHA256SUMS.txt
+          printf 'Upstream: fb8480728d875fa5e0da25eebd3a26bb71723aae\nBuild configuration: %s\n' "$GITHUB_SHA" > BUILD_INFO.txt
+
+      - name: Upload installable APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: lx-music-material-apk
+          path: output/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-reports
+          path: source/android/app/build/reports/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Write download instructions
+        run: |
+          printf '## LX Music Material APK\n\nDownload **lx-music-material-apk** from this run’s Artifacts section. Extract it and install the **universal.apk** file.\n\nApplication ID: `cn.toside.music.mobile.material`. This personal build can coexist with the official app and uses the upstream development signing key.\n' >> "$GITHUB_STEP_SUMMARY"
