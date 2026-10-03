@@ -70,7 +70,7 @@ index bd9d2ce..26da012 100644
      "node": ">= 18",
 diff --git a/scripts/test-library.cjs b/scripts/test-library.cjs
 new file mode 100644
-index 0000000..5d7611e
+index 0000000..db3db2a
 --- /dev/null
 +++ b/scripts/test-library.cjs
 @@ -0,0 +1,201 @@
@@ -87,7 +87,7 @@ index 0000000..5d7611e
 +  const source = fs.readFileSync(path.join(root, file), 'utf8')
 +  return bundle
 +    ? bundle.babelTransform(source, path.join(root, file), false, [], []).code
-+    : babel.transformSync(source, { filename: path.join(root, file), babelrc: false, configFile: false, presets: ['module:@react-native/babel-preset'] }).code
++    : babel.transformSync(source, { filename: path.join(root, file), babelrc: false, configFile: false, plugins: [['@babel/plugin-transform-typescript', { isTSX: true, allowDeclareFields: true }], ['@babel/plugin-transform-react-jsx', { runtime: 'automatic' }], '@babel/plugin-transform-modules-commonjs'] }).code
 +}
 +const jsx = { jsx: (type, props) => ({ type, props }), jsxs: (type, props) => ({ type, props }), Fragment: 'Fragment' }
 +const load = (file, mocks, extras = {}) => {
